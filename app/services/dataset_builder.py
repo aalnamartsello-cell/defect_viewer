@@ -10,12 +10,7 @@ import hashlib
 
 from app.core.config import settings, ensure_dirs
 from app.utils.json_io import atomic_write_json
-from app.services.session_store import (
-    load_session,
-    add_class_to_session,
-    get_session_classes,
-    get_global_classes,
-)
+from app.services import session_store as ss
 
 # ---------------------------------------------------------------------
 # Utils
@@ -90,6 +85,93 @@ def _sha256_file(p: Path) -> Optional[str]:
         return None
 
 
+def _resolve_accum_dataset_dir() -> Path:
+    raw = getattr(settings, "ACCUM_DATASET_DIR", None)
+    if isinstance(raw, Path):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        return Path(raw.strip())
+    return settings.DATA_DIR / "_accumulated"
+
+
+def _resolve_datasets_dir() -> Path:
+    raw = getattr(settings, "DATASETS_DIR", None)
+    if isinstance(raw, Path):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        return Path(raw.strip())
+    return settings.DATA_DIR / "datasets"
+
+
+def _get_global_classes_safe() -> List[str]:
+    """
+    Пытаемся получить registry classes:
+      1) ss.get_global_classes() если есть
+      2) data/classes.json (несколько возможных путей)
+      3) fallback: пусто
+    """
+    try:
+        fn = getattr(ss, "get_global_classes", None)
+        if callable(fn):
+            xs = fn()
+            if isinstance(xs, list) and xs:
+                return [str(x) for x in xs if str(x).strip()]
+    except Exception:
+        pass
+
+    candidates = [
+        settings.DATA_DIR / "classes.json",
+        settings.DATA_DIR / "classes_registry.json",
+        settings.BASE_DIR / "data" / "classes.json",
+    ]
+    for p in candidates:
+        try:
+            if p.exists() and p.is_file():
+                d = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(d, list) and d:
+                    return [str(x) for x in d if str(x).strip()]
+        except Exception:
+            continue
+
+    return []
+
+
+def _get_session_classes_safe(session_id: str) -> List[str]:
+    try:
+        fn = getattr(ss, "get_session_classes", None)
+        if callable(fn):
+            xs = fn(session_id)
+            if isinstance(xs, list):
+                return [str(x) for x in xs]
+    except Exception:
+        pass
+    return []
+
+
+def _add_class_to_session_safe(session_id: str, name: str) -> List[str]:
+    try:
+        fn = getattr(ss, "add_class_to_session", None)
+        if callable(fn):
+            xs = fn(session_id, name)
+            if isinstance(xs, list):
+                return [str(x) for x in xs]
+    except Exception:
+        pass
+    # fallback: return current + new
+    cur = _get_session_classes_safe(session_id)
+    if name and name not in cur:
+        cur.append(name)
+    return cur
+
+
+def _load_session_safe(session_id: str) -> Dict[str, Any]:
+    fn = getattr(ss, "load_session", None)
+    if not callable(fn):
+        raise RuntimeError("session_store.load_session() не найден")
+    s = fn(session_id)
+    return s if isinstance(s, dict) else {}
+
+
 def _resolve_photo_path(session_id: str, ph: Dict[str, Any]) -> Optional[Path]:
     # пытаемся устойчиво восстановить файл, аналогично routes.py
     rel = ph.get("relative_path")
@@ -106,7 +188,7 @@ def _resolve_photo_path(session_id: str, ph: Dict[str, Any]) -> Optional[Path]:
         try:
             rel_clean = rel.replace("\\", "/").lstrip("/")
             if rel_clean.lower().startswith("uploads/"):
-                rel_clean = rel_clean[len("uploads/") :]
+                rel_clean = rel_clean[len("uploads/"):]
             add(settings.UPLOADS_DIR / Path(rel_clean))
         except Exception:
             pass
@@ -283,7 +365,6 @@ def _uniq_classes(xs: List[str]) -> List[str]:
 
 
 def _ensure_prochee_last(xs: List[str]) -> List[str]:
-    # гарантируем, что "прочее" существует и стоит в конце
     xs2 = _uniq_classes(xs)
     proch_key = _norm_low("прочее")
 
@@ -316,11 +397,7 @@ class TrainValidationResult:
 
 
 def validate_session_for_training(session_id: str) -> TrainValidationResult:
-    """
-    ✅ Быстрый валидатор перед запуском train (на уровне одной сессии).
-    Возвращает ok/message/stats, чтобы фронт мог показать причину.
-    """
-    s = load_session(session_id)
+    s = _load_session_safe(session_id)
     photos = s.get("photos", []) if isinstance(s.get("photos"), list) else []
 
     total_photos = 0
@@ -426,24 +503,12 @@ class BuildResult:
 
 
 def build_accumulated_dataset_for_session(session_id: str, incremental: bool = True) -> BuildResult:
-    """
-    Накопительный датасет на диске:
-      settings.ACCUM_DATASET_DIR/
-        images/train
-        images/val
-        labels/train
-        labels/val
-        manifest.json
-        data.yaml
-
-    split: детерминированный по photo_id.
-    """
     ensure_dirs()
 
-    s = load_session(session_id)
+    s = _load_session_safe(session_id)
     photos = s.get("photos", []) if isinstance(s.get("photos"), list) else []
 
-    dataset_dir = settings.ACCUM_DATASET_DIR
+    dataset_dir = _resolve_accum_dataset_dir()
 
     images_train = dataset_dir / "images" / "train"
     images_val = dataset_dir / "images" / "val"
@@ -462,8 +527,8 @@ def build_accumulated_dataset_for_session(session_id: str, incremental: bool = T
     except Exception:
         manifest = {}
 
-    # ✅ classes берём из сессии (snapshot)
-    classes = _ensure_prochee_last(get_session_classes(session_id))
+    # classes — snapshot из сессии
+    classes = _ensure_prochee_last(_get_session_classes_safe(session_id))
     cls_to_idx = {c: i for i, c in enumerate(classes)}
 
     def ensure_class(cls_name: str) -> int:
@@ -472,7 +537,7 @@ def build_accumulated_dataset_for_session(session_id: str, incremental: bool = T
         if not c:
             c = "прочее"
         if c not in cls_to_idx:
-            classes = _ensure_prochee_last(add_class_to_session(session_id, c))
+            classes = _ensure_prochee_last(_add_class_to_session_safe(session_id, c))
             cls_to_idx = {cc: i for i, cc in enumerate(classes)}
         return int(cls_to_idx[c])
 
@@ -669,19 +734,6 @@ def build_yolo_det_dataset_from_all_sessions(
     seed: Optional[int] = None,
     min_train_objects: Optional[int] = None,
 ) -> GlobalBuildResult:
-    """
-    Глобальный датасет по всем sessions/*.json:
-      data/datasets/yolo_det/
-        images/train
-        images/val
-        labels/train
-        labels/val
-        manifest.json
-        data.yaml
-
-    ✅ ВАЖНО: classes берём из registry data/classes.json (get_global_classes()).
-    Это устраняет рассинхрон после rename/add.
-    """
     ensure_dirs()
 
     seed_v = int(seed) if isinstance(seed, int) else _default_seed()
@@ -689,8 +741,12 @@ def build_yolo_det_dataset_from_all_sessions(
     if min_obj <= 0:
         min_obj = 1
 
-    # ✅ ЕДИНЫЙ ИСТОЧНИК КЛАССОВ ДЛЯ GLOBAL TRAIN
-    classes = _ensure_prochee_last(get_global_classes())
+    # ✅ registry classes: get_global_classes (safe)
+    classes = _ensure_prochee_last(_get_global_classes_safe())
+    if not classes:
+        # fallback: хотя бы "прочее", чтобы не падать
+        classes = _ensure_prochee_last(["прочее"])
+
     cls_to_idx_low: Dict[str, int] = {_norm_low(c): i for i, c in enumerate(classes)}
     fallback_idx = cls_to_idx_low.get(_norm_low("прочее"), 0)
 
@@ -700,7 +756,7 @@ def build_yolo_det_dataset_from_all_sessions(
             return int(fallback_idx)
         return int(cls_to_idx_low.get(nn, fallback_idx))
 
-    dataset_dir = settings.DATASETS_DIR / "yolo_det"
+    dataset_dir = _resolve_datasets_dir() / "yolo_det"
     images_train = dataset_dir / "images" / "train"
     images_val = dataset_dir / "images" / "val"
     labels_train = dataset_dir / "labels" / "train"
@@ -744,8 +800,7 @@ def build_yolo_det_dataset_from_all_sessions(
         sessions_scanned += 1
 
         try:
-            # ✅ берём через load_session (устойчивость схемы)
-            s = load_session(session_id)
+            s = _load_session_safe(session_id)
         except Exception:
             continue
 
