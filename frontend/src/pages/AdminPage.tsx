@@ -2,24 +2,20 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
-  Shield,
-  Sparkles,
-  RefreshCw,
   Cpu,
-  HardDrive,
-  Hash,
-  Clock,
+  RefreshCw,
+  Wand2,
+  Brain,
   Tag,
+  Database,
   Pencil,
   Save,
   X,
-  Database,
-  Layers,
   AlertTriangle,
   CheckCircle2,
-  ArrowRight,
-  Wand2,
-  Brain,
+  Hash,
+  Clock,
+  HardDrive,
   Play,
 } from "lucide-react";
 
@@ -28,6 +24,7 @@ import ProgressBar from "../components/ui/ProgressBar";
 import Modal from "../components/ui/Modal";
 import { toast } from "../components/ui/ToastCenter";
 import { useAppStore } from "../store/useAppStore";
+import { useTrainStore } from "../store/useTrainStore";
 import { api } from "../api/api";
 import { DEFECT_CLASSES } from "../constants/defects";
 import type { OperatorDecision, PhotoItem } from "../types";
@@ -41,10 +38,6 @@ function normalizeClassName(s: string) {
 
 function normKey(s: string) {
   return normalizeClassName(s).toLowerCase();
-}
-
-function clamp(v: number, a: number, b: number) {
-  return Math.max(a, Math.min(b, v));
 }
 
 function fmtBytes(n: any) {
@@ -87,9 +80,7 @@ function mtimeFromNs(mtimeNs: any): string {
   return `${dd}.${mo}.${yy} ${fmtTimeHHMMSS(dt)}`;
 }
 
-/**
- * ✅ Рекурсивный поиск значений по ключам в любом вложении.
- */
+/** ✅ Рекурсивный поиск значений по ключам в любом вложении. */
 function deepPickFirst(obj: any, keys: string[]) {
   const wanted = new Set(keys.map((k) => String(k).toLowerCase()));
   const seen = new Set<any>();
@@ -106,17 +97,12 @@ function deepPickFirst(obj: any, keys: string[]) {
     seen.add(cur);
 
     for (const k of Object.keys(cur)) {
-      if (wanted.has(String(k).toLowerCase())) {
-        return (cur as any)[k];
-      }
+      if (wanted.has(String(k).toLowerCase())) return (cur as any)[k];
     }
-
     for (const v of Object.values(cur)) {
-      if (!v) continue;
-      if (typeof v === "object") q.push(v);
+      if (v && typeof v === "object") q.push(v);
     }
   }
-
   return undefined;
 }
 
@@ -148,158 +134,28 @@ function splitIsValLikeBackend(photoId: string) {
   return h % 10 < 2;
 }
 
-/**
- * Бэк часто отдаёт epoch как:
- * - number: 12
- * - string: "12/30"
- * - или epoch_current / current_epoch / epochs_total и т.п.
- */
-function parseEpochInfo(st: any): { epoch: number; total: number } {
-  const pick = (...keys: string[]) => {
-    for (const k of keys) if (st && st[k] !== undefined && st[k] !== null) return st[k];
-    return undefined;
-  };
-
-  const rawEpoch = pick("epoch", "epoch_current", "current_epoch", "epoch_idx", "epochIndex");
-  const rawTotal = pick("epochs_total", "epochsTotal", "epochs", "total_epochs", "totalEpochs");
-
-  let epoch = 0;
-  let total = 0;
-
-  if (typeof rawTotal === "number" && Number.isFinite(rawTotal)) total = rawTotal;
-  else if (typeof rawTotal === "string") {
-    const t = Number(rawTotal.trim());
-    if (Number.isFinite(t)) total = t;
-  }
-
-  if (typeof rawEpoch === "number" && Number.isFinite(rawEpoch)) {
-    epoch = rawEpoch;
-  } else if (typeof rawEpoch === "string") {
-    const s = rawEpoch.trim();
-    const m = s.match(/(\d+)\s*\/\s*(\d+)/);
-    if (m) {
-      epoch = Number(m[1]) || 0;
-      const t = Number(m[2]) || 0;
-      if (!total && t) total = t;
-    } else {
-      const n = Number(s);
-      if (Number.isFinite(n)) epoch = n;
-    }
-  }
-
-  if ((!epoch || !total) && typeof st?.progress_text === "string") {
-    const mm = st.progress_text.match(/(\d+)\s*\/\s*(\d+)/);
-    if (mm) {
-      if (!epoch) epoch = Number(mm[1]) || 0;
-      if (!total) total = Number(mm[2]) || 0;
-    }
-  }
-
-  epoch = Number.isFinite(epoch) ? Math.max(0, Math.floor(epoch)) : 0;
-  total = Number.isFinite(total) ? Math.max(0, Math.floor(total)) : 0;
-
-  return { epoch, total };
-}
-
-/**
- * Для "точной" полоски: пытаемся вытащить прогресс внутри эпохи (батч i/n).
- */
-function parseBatchInfo(st: any): { batch: number; total: number } {
-  const pick = (...keys: string[]) => {
-    for (const k of keys) if (st && st[k] !== undefined && st[k] !== null) return st[k];
-    return undefined;
-  };
-
-  const rawBatch = pick("batch", "batch_i", "batchIndex", "batch_idx", "iter", "i");
-  const rawTotal = pick("batches_total", "batch_total", "nb", "n_batches", "batches", "iters_total");
-
-  let batch = 0;
-  let total = 0;
-
-  if (typeof rawTotal === "number" && Number.isFinite(rawTotal)) total = rawTotal;
-  else if (typeof rawTotal === "string") {
-    const t = Number(rawTotal.trim());
-    if (Number.isFinite(t)) total = t;
-  }
-
-  if (typeof rawBatch === "number" && Number.isFinite(rawBatch)) batch = rawBatch;
-  else if (typeof rawBatch === "string") {
-    const n = Number(rawBatch.trim());
-    if (Number.isFinite(n)) batch = n;
-  }
-
-  const text = String(st?.progress_text ?? st?.message ?? "");
-  if ((!batch || !total) && text) {
-    const m = text.match(/батч\s*(\d+)\s*\/\s*(\d+)/i);
-    if (m) {
-      if (!batch) batch = Number(m[1]) || 0;
-      if (!total) total = Number(m[2]) || 0;
-    } else {
-      const mm = text.match(/batch\s*(\d+)\s*\/\s*(\d+)/i);
-      if (mm) {
-        if (!batch) batch = Number(mm[1]) || 0;
-        if (!total) total = Number(mm[2]) || 0;
-      }
-    }
-  }
-
-  batch = Number.isFinite(batch) ? Math.max(0, Math.floor(batch)) : 0;
-  total = Number.isFinite(total) ? Math.max(0, Math.floor(total)) : 0;
-
-  return { batch, total };
-}
-
-/**
- * Самый точный progress 0..1:
- *  1) st.progress (если 0..1)
- *  2) epoch/total + batch/nb (если есть)
- *  3) epoch/total
- */
-function computeProgress01(st: any) {
-  const raw = Number(st?.progress);
-  if (Number.isFinite(raw) && raw > 0 && raw <= 1.000001) {
-    return clamp(raw, 0, 1);
-  }
-
-  const { epoch, total } = parseEpochInfo(st);
-  const { batch, total: batchTotal } = parseBatchInfo(st);
-
-  if (total > 0) {
-    const epUi = epoch <= 0 ? 0 : epoch;
-    const ep0 = epUi > 0 ? epUi - 1 : 0;
-
-    let frac = 0;
-    if (batchTotal > 0) {
-      frac = clamp(batch / batchTotal, 0, 1);
-    }
-
-    const p = (ep0 + frac) / total;
-    return clamp(Math.min(0.99, p), 0, 0.99);
-  }
-
-  return 0;
-}
-
-function ScrollLink({ toId, label, icon }: { toId: string; label: string; icon: React.ReactNode }) {
+function Card({
+  title,
+  icon,
+  right,
+  children,
+}: {
+  title: string;
+  icon?: React.ReactNode;
+  right?: React.ReactNode;
+  children: React.ReactNode;
+}) {
   return (
-    <button
-      type="button"
-      onClick={() => {
-        const el = document.getElementById(toId);
-        if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
-      }}
-      className={[
-        "w-full flex items-center justify-between gap-3",
-        "rounded-2xl border px-3 py-2 text-sm font-semibold transition",
-        "border-white/10 bg-white/[0.03] text-white/75 hover:bg-white/[0.06]",
-      ].join(" ")}
-    >
-      <span className="inline-flex items-center gap-2">
-        <span className="opacity-90">{icon}</span>
-        <span>{label}</span>
-      </span>
-      <ArrowRight className="h-4 w-4 text-white/40" />
-    </button>
+    <section className="rounded-[28px] border border-white/10 bg-ink-900/55 backdrop-blur-xl shadow-[0_18px_70px_rgba(0,0,0,0.45)] overflow-hidden">
+      <div className="px-5 py-4 border-b border-white/10 bg-black/20 flex items-center justify-between gap-3">
+        <div className="min-w-0 flex items-center gap-2">
+          <span className="text-white/70">{icon}</span>
+          <h2 className="text-sm md:text-base font-semibold text-white/90 truncate">{title}</h2>
+        </div>
+        {right}
+      </div>
+      <div className="p-5">{children}</div>
+    </section>
   );
 }
 
@@ -309,6 +165,36 @@ export default function AdminPage() {
   const { sessionId, photos, decisionByPhoto, setPhotos, setDecision } = useAppStore();
   const items = photos ?? [];
   const decisions = (decisionByPhoto ?? {}) as Record<string, OperatorDecision | undefined>;
+
+  // ===== TRAIN (GLOBAL via store) =====
+  const train = useTrainStore((s) => ({
+    jobId: s.jobId,
+    status: s.status,
+    message: s.message,
+    progress: s.progress,
+    epoch: s.epoch,
+    epochsTotal: s.epochsTotal,
+    batch: s.batch,
+    batchesTotal: s.batchesTotal,
+    patch: s.patch,
+    reset: s.reset,
+  }));
+
+  const trainBusy = train.status === "queued" || train.status === "running";
+  const canTrain = Boolean(sessionId) && items.length > 0;
+
+  const [trainOpen, setTrainOpen] = useState(false);
+
+  const trainBadge =
+    train.status === "done"
+      ? { text: "done", cls: "border-emerald-300/20 bg-emerald-500/10 text-emerald-200" }
+      : train.status === "error"
+      ? { text: "error", cls: "border-red-300/20 bg-red-500/10 text-red-200" }
+      : train.status === "running"
+      ? { text: "running", cls: "border-orange-300/20 bg-orange-500/10 text-orange-200" }
+      : train.status === "queued"
+      ? { text: "queued", cls: "border-orange-300/20 bg-orange-500/10 text-orange-200" }
+      : { text: "idle", cls: "border-white/10 bg-white/[0.03] text-white/70" };
 
   // ===== ML HEALTH =====
   const [mlHealth, setMlHealth] = useState<any>(null);
@@ -362,7 +248,6 @@ export default function AdminPage() {
     try {
       const res = await api.healthML({ load: true });
       applyHealthResponse(res, { toastOnWeightsChange: true });
-
       toast.success("✅ Перезагрузка весов выполнена");
       void loadMlHealth({ silent: true, toastOnWeightsChange: true });
     } catch (e: any) {
@@ -381,6 +266,14 @@ export default function AdminPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // если обучение завершилось — обновим карточку весов (удобно, когда пользователь вернулся на админку)
+  useEffect(() => {
+    if (train.status === "done") {
+      void loadMlHealth({ silent: true, toastOnWeightsChange: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [train.status]);
+
   const weightsPath = deepPickString(mlHealth, ["weights", "weights_path", "model_path", "path", "file", "pt_path", "best_path"]);
   const sha = deepPickString(mlHealth, ["sha256", "sha", "model_sha256", "hash"]);
   const mtimeNs = deepPickNumber(mlHealth, ["mtime_ns", "mtime", "modified_ns", "mtimeNanos"]);
@@ -397,8 +290,7 @@ export default function AdminPage() {
     ? "bg-emerald-400/20 border-emerald-300/25"
     : "bg-white/10 border-white/10";
 
-  const updatedLabel =
-    mlHealthUpdatedAt ? `обновлено: ${fmtTimeHHMMSS(mlHealthUpdatedAt)} • авто-обновление каждые 30с` : "—";
+  const updatedLabel = mlHealthUpdatedAt ? `обновлено: ${fmtTimeHHMMSS(mlHealthUpdatedAt)}` : "—";
 
   // ===== CLASSES =====
   const [classes, setClasses] = useState<string[]>([]);
@@ -424,7 +316,6 @@ export default function AdminPage() {
       setClasses(getFallbackClasses());
       return;
     }
-
     if (clsBusy) return;
     setClsBusy(true);
     try {
@@ -445,10 +336,7 @@ export default function AdminPage() {
   }, [sessionId]);
 
   const openRename = (cls: string) => {
-    if (!sessionId) {
-      toast.error("Нет sessionId. Сначала загрузи фото (страница Загрузка).");
-      return;
-    }
+    if (!sessionId) return toast.error("Нет sessionId. Сначала загрузи фото (страница Загрузка).");
     setRenameFrom(cls);
     setRenameTo(cls);
     setRenameOpen(true);
@@ -468,8 +356,7 @@ export default function AdminPage() {
 
     for (const p of nextPhotos) {
       const d = decisions[p.id];
-      if (!d) continue;
-      if (d.type !== "defect") continue;
+      if (!d || d.type !== "defect") continue;
 
       const nd = {
         ...d,
@@ -481,27 +368,15 @@ export default function AdminPage() {
   };
 
   const submitRename = async () => {
-    if (!sessionId) {
-      toast.error("Нет sessionId. Сначала загрузи фото (страница Загрузка).");
-      return;
-    }
+    if (!sessionId) return toast.error("Нет sessionId. Сначала загрузи фото (страница Загрузка).");
     if (renameBusy) return;
 
     const from = normalizeClassName(renameFrom);
     const to = normalizeClassName(renameTo);
 
-    if (!from || !to) {
-      toast.info("Заполни оба поля");
-      return;
-    }
-    if (from.length < 2 || to.length < 2) {
-      toast.info("Слишком короткое название");
-      return;
-    }
-    if (normKey(from) === normKey(to)) {
-      toast.info("Новое имя совпадает со старым");
-      return;
-    }
+    if (!from || !to) return toast.info("Заполни оба поля");
+    if (from.length < 2 || to.length < 2) return toast.info("Слишком короткое название");
+    if (normKey(from) === normKey(to)) return toast.info("Новое имя совпадает со старым");
 
     setRenameBusy(true);
     try {
@@ -515,7 +390,6 @@ export default function AdminPage() {
       });
 
       const res = await api.renameSessionClass(sessionId, from, to);
-
       const remote = normalizeRemoteClasses(res?.classes);
       if (remote.length) setClasses(remote);
 
@@ -534,13 +408,11 @@ export default function AdminPage() {
   // ===== DATASET DIAGNOSTICS =====
   const datasetDiag = useMemo(() => {
     const images = { train: 0, val: 0 };
-    const decided = { train: 0, val: 0 };
     const labeledPhotos = { train: 0, val: 0 };
     const boxes = { train: 0, val: 0 };
 
     const byClassTrain: Record<string, number> = {};
     const byClassVal: Record<string, number> = {};
-
     const classSetTrain = new Set<string>();
     const classSetVal = new Set<string>();
 
@@ -549,23 +421,21 @@ export default function AdminPage() {
       images[split]++;
 
       const d = decisions[p.id];
-      if (d) decided[split]++;
-
       const bxs = p.bboxes ?? [];
       const isLabeled = d?.type === "defect" && bxs.length > 0;
-      if (isLabeled) {
-        labeledPhotos[split]++;
-        boxes[split] += bxs.length;
+      if (!isLabeled) continue;
 
-        for (const b of bxs) {
-          const cls = String((b as any).cls ?? "").trim() || "unknown";
-          if (split === "train") {
-            byClassTrain[cls] = (byClassTrain[cls] ?? 0) + 1;
-            classSetTrain.add(cls);
-          } else {
-            byClassVal[cls] = (byClassVal[cls] ?? 0) + 1;
-            classSetVal.add(cls);
-          }
+      labeledPhotos[split]++;
+      boxes[split] += bxs.length;
+
+      for (const b of bxs) {
+        const cls = String((b as any).cls ?? "").trim() || "unknown";
+        if (split === "train") {
+          byClassTrain[cls] = (byClassTrain[cls] ?? 0) + 1;
+          classSetTrain.add(cls);
+        } else {
+          byClassVal[cls] = (byClassVal[cls] ?? 0) + 1;
+          classSetVal.add(cls);
         }
       }
     }
@@ -586,34 +456,10 @@ export default function AdminPage() {
     const ok = warnings.length === 0;
 
     const classRows = allClasses
-      .map((cls) => ({
-        cls,
-        train: byClassTrain[cls] ?? 0,
-        val: byClassVal[cls] ?? 0,
-      }))
+      .map((cls) => ({ cls, train: byClassTrain[cls] ?? 0, val: byClassVal[cls] ?? 0 }))
       .sort((a, b) => b.train + b.val - (a.train + a.val));
 
-    return {
-      ok,
-      warnings,
-      images,
-      decided,
-      labeledPhotos,
-      boxes,
-      classRows,
-    };
-  }, [items, decisions]);
-
-  const decidedCount = useMemo(() => {
-    let c = 0;
-    for (const p of items) if (decisions[p.id]) c++;
-    return c;
-  }, [items, decisions]);
-
-  const unresolvedCount = useMemo(() => {
-    let c = 0;
-    for (const p of items) if (!decisions[p.id]) c++;
-    return c;
+    return { ok, warnings, images, boxes, classRows };
   }, [items, decisions]);
 
   const heroKpi = useMemo(() => {
@@ -621,75 +467,15 @@ export default function AdminPage() {
     const defect = items.filter((p) => decisions[p.id]?.type === "defect").length;
     const ok = items.filter((p) => decisions[p.id]?.type === "ok").length;
     const bboxes = items.reduce((s, p) => s + (p.bboxes?.length ?? 0), 0);
-    return { total, ok, defect, bboxes };
+    const decidedCount = items.filter((p) => Boolean(decisions[p.id])).length;
+    const unresolvedCount = total - decidedCount;
+    return { total, ok, defect, bboxes, decidedCount, unresolvedCount };
   }, [items, decisions]);
-
-  // =========================
-  // ===== TRAIN (moved here)
-  // =========================
-  const canTrain = decidedCount >= 1 && Boolean(sessionId);
-
-  const [trainOpen, setTrainOpen] = useState(false);
-  const [trainBusy, setTrainBusy] = useState(false);
-  const [trainJobId, setTrainJobId] = useState<string | null>(null);
-  const [trainStatus, setTrainStatus] = useState<"idle" | "queued" | "running" | "done" | "error">("idle");
-  const [trainMessage, setTrainMessage] = useState<string>("");
-  const [trainProgress, setTrainProgress] = useState<number>(0);
-
-  const [trainEpoch, setTrainEpoch] = useState<number>(0);
-  const [trainEpochsTotal, setTrainEpochsTotal] = useState<number>(0);
-  const [trainBatch, setTrainBatch] = useState<number>(0);
-  const [trainBatchesTotal, setTrainBatchesTotal] = useState<number>(0);
-
-  const fallbackTickRef = useRef<number | null>(null);
-  const pollTimerRef = useRef<number | null>(null);
-
-  const trainStatusRef = useRef(trainStatus);
-  useEffect(() => {
-    trainStatusRef.current = trainStatus;
-  }, [trainStatus]);
-
-  function stopPolling() {
-    if (pollTimerRef.current) {
-      window.clearInterval(pollTimerRef.current);
-      pollTimerRef.current = null;
-    }
-  }
-
-  function stopFallbackTick() {
-    if (fallbackTickRef.current) {
-      window.clearInterval(fallbackTickRef.current);
-      fallbackTickRef.current = null;
-    }
-  }
-
-  function startFallbackTick() {
-    stopFallbackTick();
-    fallbackTickRef.current = window.setInterval(() => {
-      setTrainProgress((p) => {
-        const st = trainStatusRef.current;
-        const cap = st === "queued" ? 35 : 92;
-        if (p >= cap) return p;
-        const step = p < 50 ? 2.2 : p < 80 ? 1.1 : 0.55;
-        return clamp(p + step, 0, cap);
-      });
-    }, 220);
-  }
-
-  useEffect(() => {
-    return () => {
-      stopPolling();
-      stopFallbackTick();
-    };
-  }, []);
 
   async function syncAllToBackend() {
     if (!sessionId) throw new Error("Нет sessionId. Вернись на Загрузку и загрузи фото заново.");
     const decidedPhotos = items.filter((p) => decisions[p.id]);
-
-    if (!decidedPhotos.length) {
-      throw new Error("Нет решений. Сначала отметьте хотя бы одно фото (Есть дефект / Дефектов нет).");
-    }
+    if (!decidedPhotos.length) throw new Error("Нет решений. Сначала отметьте хотя бы одно фото.");
 
     toast.info(`Синхронизация с бэком… (${decidedPhotos.length} шт.)`);
 
@@ -730,163 +516,60 @@ export default function AdminPage() {
     toast.success("Синхронизировано с бэком");
   }
 
-  function resetTrainUi() {
-    setTrainJobId(null);
-    setTrainStatus("idle");
-    setTrainMessage("");
-    setTrainProgress(0);
-    setTrainEpoch(0);
-    setTrainEpochsTotal(0);
-    setTrainBatch(0);
-    setTrainBatchesTotal(0);
-  }
-
   async function startTrainFlow() {
     if (trainBusy) return;
-
-    if (!sessionId) {
-      toast.error("Нет sessionId. Вернись на Загрузку и загрузи фото заново.");
-      return;
-    }
-    if (decidedCount < 1) {
-      toast.info("Сначала проставь решение хотя бы на одном фото (в Просмотре).");
-      return;
-    }
+    if (!sessionId) return toast.error("Нет sessionId. Вернись на Загрузку и загрузи фото заново.");
+    if (heroKpi.decidedCount < 1) return toast.info("Нужно хотя бы одно решение в “Разметка”.");
 
     setTrainOpen(true);
-    setTrainBusy(true);
-    setTrainJobId(null);
-    setTrainStatus("queued");
-    setTrainMessage("Подготовка…");
-    setTrainProgress(5);
-    setTrainEpoch(0);
-    setTrainEpochsTotal(0);
-    setTrainBatch(0);
-    setTrainBatchesTotal(0);
+
+    // подготовка UI
+    train.patch({
+      jobId: null,
+      status: "queued",
+      message: "Подготовка…",
+      progress: 5,
+      epoch: 0,
+      epochsTotal: 0,
+      batch: 0,
+      batchesTotal: 0,
+      startedAt: Date.now(),
+    });
 
     try {
-      setTrainMessage("Синхронизация разметки с бэком…");
-      setTrainProgress(10);
+      train.patch({ message: "Синхронизация разметки…", progress: 12 });
       await syncAllToBackend();
 
-      setTrainMessage("Запускаем обучение…");
-      setTrainStatus("queued");
-      setTrainProgress(18);
+      train.patch({ message: "Запуск обучения…", progress: 18, status: "queued" });
 
       const started = await api.trainSession(sessionId);
       const jobId = started.job_id;
 
-      setTrainJobId(jobId);
-      setTrainMessage(started.message || "Обучение поставлено в очередь…");
-
-      stopPolling();
-      stopFallbackTick();
-      startFallbackTick();
-
-      pollTimerRef.current = window.setInterval(async () => {
-        try {
-          const st = await api.trainStatus(jobId);
-
-          setTrainStatus(st.status as any);
-          setTrainMessage(st.message || "");
-
-          const { epoch, total } = parseEpochInfo(st);
-          setTrainEpoch(epoch);
-          if (total > 0) setTrainEpochsTotal(total);
-
-          const { batch, total: bt } = parseBatchInfo(st);
-          setTrainBatch(batch);
-          setTrainBatchesTotal(bt);
-
-          const prog01 = computeProgress01(st);
-
-          if (st.status === "queued") {
-            setTrainProgress((p) => Math.max(p, 22));
-          }
-
-          if (st.status === "running") {
-            if (prog01 > 0) {
-              stopFallbackTick();
-              const pct = Math.round(clamp(prog01 * 100, 0, 99));
-              setTrainProgress((p) => Math.max(p, pct));
-            } else {
-              setTrainProgress((p) => clamp(p + 1.1, 35, 92));
-            }
-          }
-
-          if (st.status === "done") {
-            stopPolling();
-            stopFallbackTick();
-
-            setTrainProgress(100);
-            setTrainBusy(false);
-
-            const modelPath = (st as any).model_path ? `\nМодель: ${(st as any).model_path}` : "";
-            setTrainMessage(`Готово ✅ В модель добавлены новые файлы для обучения.${modelPath}`);
-
-            toast.success("Обучение завершено: model.pt обновлён");
-            // обновим ML карточку, чтобы сразу увидеть новый sha/mtime/size
-            void loadMlHealth({ silent: true, toastOnWeightsChange: true });
-          }
-
-          if (st.status === "error") {
-            stopPolling();
-            stopFallbackTick();
-
-            setTrainBusy(false);
-            setTrainProgress((p) => Math.max(p, 70));
-            setTrainMessage(st.message || "Ошибка обучения");
-
-            toast.error("Ошибка обучения (см. сообщение в окне)");
-          }
-        } catch {
-          setTrainMessage((m) => (m ? m : "Ожидаем статус…"));
-        }
-      }, 800);
+      train.patch({
+        jobId,
+        status: "queued",
+        message: started.message || "Обучение в очереди…",
+        progress: Math.max(train.progress, 22),
+      });
     } catch (e: any) {
-      stopPolling();
-      stopFallbackTick();
-
-      setTrainBusy(false);
-      setTrainStatus("error");
-      setTrainMessage(e?.message ?? "Ошибка запуска обучения");
+      train.patch({
+        status: "error",
+        message: e?.message ?? "Ошибка запуска обучения",
+        progress: Math.max(train.progress, 70),
+      });
       toast.error(e?.message ?? "Ошибка запуска обучения");
     }
   }
 
-  const lastTrainBadge =
-    trainStatus === "done"
-      ? { text: "done", cls: "border-emerald-300/20 bg-emerald-500/10 text-emerald-200" }
-      : trainStatus === "error"
-      ? { text: "error", cls: "border-red-300/20 bg-red-500/10 text-red-200" }
-      : trainStatus === "running"
-      ? { text: "running", cls: "border-orange-300/20 bg-orange-500/10 text-orange-200" }
-      : trainStatus === "queued"
-      ? { text: "queued", cls: "border-orange-300/20 bg-orange-500/10 text-orange-200" }
-      : { text: "idle", cls: "border-white/10 bg-white/[0.03] text-white/70" };
+  const splitTotal = datasetDiag.images.train + datasetDiag.images.val;
+  const trainPct = splitTotal ? Math.round((datasetDiag.images.train / splitTotal) * 100) : 0;
+  const valPct = splitTotal ? Math.round((datasetDiag.images.val / splitTotal) * 100) : 0;
 
   return (
     <div className="h-full w-full">
       {/* ===== Rename modal ===== */}
       <Modal open={renameOpen} onClose={() => !renameBusy && setRenameOpen(false)} title="Переименование класса">
         <div className="space-y-4">
-          <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4">
-            <div className="flex items-start gap-3">
-              <div className="mt-0.5 h-10 w-10 rounded-2xl bg-orange-500/[0.12] border border-orange-300/20 flex items-center justify-center">
-                <Tag className="h-5 w-5 text-orange-200" />
-              </div>
-              <div className="min-w-0">
-                <div className="text-sm font-semibold text-white/90">Rename класса дефекта</div>
-                <div className="mt-1 text-xs text-white/60 leading-relaxed">
-                  После применения имя обновится <span className="text-white/80">во всех bbox</span> и{" "}
-                  <span className="text-white/80">в решениях оператора</span> локально.
-                  <br />
-                  Далее синхронизируем это с бэком (эндпоинт подключим следующим шагом).
-                </div>
-              </div>
-            </div>
-          </div>
-
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <label className="text-xs text-white/60">
               Было
@@ -916,88 +599,57 @@ export default function AdminPage() {
               {renameBusy ? "Применяем…" : "Переименовать"}
             </Button>
           </div>
+
+          <div className="text-[11px] text-white/45 leading-relaxed">
+            Переименование применяется локально к bbox и решениям. Если бэк пока не поддерживает rename — увидишь предупреждение.
+          </div>
         </div>
       </Modal>
 
-      {/* ===== Train modal (using existing Modal) ===== */}
-      <Modal
-        open={trainOpen}
-        onClose={() => setTrainOpen(false)}
-        title="Обучение модели"
-      >
+      {/* ===== Train modal ===== */}
+      <Modal open={trainOpen} onClose={() => setTrainOpen(false)} title="Обучение модели">
         <div className="space-y-4">
           <div className="rounded-2xl border border-white/10 bg-black/25 p-4">
-            <div className="flex items-center gap-3">
-              <div
-                className="h-10 w-10 rounded-2xl border border-white/10 bg-white/[0.04] flex items-center justify-center"
-                title="Статус"
-              >
-                <div
-                  className={[
-                    "h-5 w-5 rounded-full",
-                    trainStatus === "done"
-                      ? "bg-emerald-400/80"
-                      : trainStatus === "error"
-                      ? "bg-red-400/80"
-                      : "bg-orange-400/80 animate-pulse",
-                  ].join(" ")}
-                />
-              </div>
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="text-sm font-semibold text-white/85 truncate">{train.message || "…"}</div>
+                <div className="mt-1 text-xs text-white/55 tabular-nums">
+                  <span className={["inline-flex items-center rounded-full border px-2 py-0.5", trainBadge.cls].join(" ")}>
+                    {trainBadge.text}
+                  </span>
+                  {train.jobId ? <span className="ml-2 text-white/45">job: {train.jobId}</span> : null}
+                </div>
 
-              <div className="min-w-0 flex-1">
-                <div className="text-sm font-semibold text-white/85 truncate">{trainMessage || "…"}</div>
-
-                {(trainStatus === "running" || trainStatus === "queued") && trainEpochsTotal > 0 ? (
-                  <div className="text-xs text-white/55 mt-1 tabular-nums">
-                    эпоха: {trainEpoch}/{trainEpochsTotal}
-                    {trainBatchesTotal > 0 && trainBatch > 0 ? (
-                      <span className="text-white/45"> • батч {trainBatch}/{trainBatchesTotal}</span>
-                    ) : null}
+                {train.status === "running" && train.epochsTotal > 0 ? (
+                  <div className="mt-1 text-xs text-white/45 tabular-nums">
+                    эпоха {train.epoch}/{train.epochsTotal}
+                    {train.batchesTotal > 0 && train.batch > 0 ? <span> • батч {train.batch}/{train.batchesTotal}</span> : null}
                   </div>
                 ) : null}
-
-                {trainJobId ? <div className="text-xs text-white/50 mt-0.5 tabular-nums">job: {trainJobId}</div> : null}
               </div>
 
-              <div className="text-xs text-white/60 tabular-nums">{Math.round(trainProgress)}%</div>
+              <div className="text-xs text-white/60 tabular-nums">{Math.round(train.progress)}%</div>
             </div>
 
             <div className="mt-3">
-              <ProgressBar value={trainProgress} />
+              <ProgressBar value={train.progress} />
             </div>
 
-            {trainStatus !== "done" && trainStatus !== "error" ? (
-              <div className="mt-3 text-xs text-white/55">Можно закрыть окно — обучение продолжится в фоне.</div>
-            ) : null}
-
-            {trainStatus === "done" ? (
-              <div className="mt-3 text-sm text-emerald-200">Готово ✅ model.pt обновлён.</div>
-            ) : null}
-
-            {trainStatus === "error" ? (
-              <div className="mt-3 text-sm text-red-200">Ошибка ❌ Проверь сообщение и попробуй ещё раз.</div>
-            ) : null}
+            <div className="mt-3 text-xs text-white/55">
+              Можно закрыть окно и переходить по страницам — статус не сбросится и будет обновляться.
+            </div>
           </div>
 
           <div className="flex items-center justify-end gap-2">
-            {trainStatus === "done" || trainStatus === "error" ? (
-              <Button
-                variant="primary"
-                onClick={() => {
-                  stopPolling();
-                  stopFallbackTick();
-                  setTrainBusy(false);
-                  setTrainOpen(false);
-                  resetTrainUi();
-                }}
-              >
-                Закрыть
+            {(train.status === "done" || train.status === "error") && (
+              <Button variant="secondary" onClick={() => train.reset()}>
+                Сбросить
               </Button>
-            ) : (
-              <Button onClick={() => setTrainOpen(false)}>Скрыть</Button>
             )}
-
-            {trainStatus === "error" ? (
+            <Button variant="primary" onClick={() => setTrainOpen(false)}>
+              Закрыть
+            </Button>
+            {train.status === "error" ? (
               <Button variant="secondary" onClick={() => void startTrainFlow()} disabled={trainBusy}>
                 Повторить
               </Button>
@@ -1006,594 +658,383 @@ export default function AdminPage() {
         </div>
       </Modal>
 
-      <div className="mx-auto max-w-[1400px] px-5 pt-10 pb-10">
-        {/* ===== HERO ===== */}
-        <div className="relative overflow-hidden rounded-[32px] border border-white/10 bg-ink-900/60 backdrop-blur-xl shadow-[0_35px_140px_rgba(0,0,0,.62)]">
-          <div className="pointer-events-none absolute inset-0">
-            <div className="absolute -top-24 -left-24 h-72 w-72 rounded-full bg-orange-500/12 blur-3xl" />
-            <div className="absolute -top-20 right-10 h-80 w-80 rounded-full bg-amber-300/10 blur-3xl" />
-            <div className="absolute -bottom-32 left-1/2 h-96 w-96 -translate-x-1/2 rounded-full bg-white/[0.04] blur-3xl" />
-            <div className="absolute inset-0 bg-gradient-to-r from-white/[0.03] via-transparent to-white/[0.03]" />
-            <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-orange-300/30 to-transparent" />
-            <div className="absolute inset-x-0 bottom-0 h-px bg-gradient-to-r from-transparent via-white/10 to-transparent" />
-          </div>
-
-          <div className="relative p-7 md:p-9">
-            <div className="flex flex-wrap items-start justify-between gap-5">
-              <div className="min-w-0">
-                <div className="inline-flex items-center gap-2 rounded-2xl border border-orange-300/15 bg-orange-500/[0.06] px-3 py-2">
-                  <Shield className="h-4 w-4 text-orange-200" />
-                  <span className="text-xs font-semibold text-orange-100">Админка</span>
-                  <span className="text-[11px] text-white/55">модель • обучение • классы • диагностика</span>
-                </div>
-
-                <div className="mt-4 text-3xl md:text-4xl font-semibold tracking-tight">Control Center</div>
-                <div className="mt-2 text-sm md:text-base text-white/70 max-w-[920px] leading-relaxed">
-                  Панель для ML: веса/health, обучение (с прогрессом), переименование классов и диагностика train/val.
-                </div>
-
-                <div className="mt-4 inline-flex items-center gap-2 rounded-2xl border px-3 py-2 text-xs font-semibold border-white/10 bg-white/[0.03] text-white/70">
-                  <Brain className="h-4 w-4 text-white/60" />
-                  Train:
-                  <span className={["rounded-full border px-2 py-0.5", lastTrainBadge.cls].join(" ")}>{lastTrainBadge.text}</span>
-                  {trainJobId ? <span className="text-white/55 tabular-nums">job: {trainJobId}</span> : null}
-                </div>
+      <div className="mx-auto max-w-[1200px] px-5 pt-8 pb-10 space-y-4">
+        {/* ===== TOP BAR ===== */}
+        <div className="rounded-[28px] border border-white/10 bg-ink-900/55 backdrop-blur-xl shadow-[0_18px_70px_rgba(0,0,0,0.45)] p-5">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div className="min-w-0">
+              <div className="text-xl md:text-2xl font-semibold tracking-tight text-white/90">Админка</div>
+              <div className="mt-1 text-sm text-white/60">
+                session: <span className="text-white/80 tabular-nums">{sessionId || "—"}</span>
               </div>
 
-              <div className="flex flex-col gap-2 w-full sm:w-auto">
-                <div className="grid grid-cols-2 gap-2">
-                  <div className="rounded-3xl border border-white/10 bg-black/25 p-4">
-                    <div className="text-[11px] text-white/55">Фото</div>
-                    <div className="mt-1 text-2xl font-semibold tabular-nums">{heroKpi.total}</div>
-                    <div className="mt-1 text-[11px] text-white/50">bbox: {heroKpi.bboxes}</div>
-                  </div>
-                  <div className="rounded-3xl border border-white/10 bg-black/25 p-4">
-                    <div className="text-[11px] text-white/55">Решения</div>
-                    <div className="mt-1 text-2xl font-semibold tabular-nums">{decidedCount}</div>
-                    <div className="mt-1 text-[11px] text-white/50">нерешённых: {unresolvedCount}</div>
-                  </div>
-                </div>
-
-                <div className="flex gap-2 justify-end">
-                  <Button variant="secondary" onClick={() => nav("/viewer")} leftIcon={<Wand2 className="h-4 w-4" />}>
-                    В просмотр
-                  </Button>
-                  <Button variant="primary" onClick={() => nav("/summary")} leftIcon={<Sparkles className="h-4 w-4" />}>
-                    Итоги
-                  </Button>
-                </div>
+              <div className="mt-3 flex flex-wrap gap-2 text-xs">
+                <span className="rounded-2xl border border-white/10 bg-black/25 px-3 py-2 text-white/70 tabular-nums">
+                  фото: <span className="text-white/90 font-semibold">{heroKpi.total}</span>
+                </span>
+                <span className="rounded-2xl border border-white/10 bg-black/25 px-3 py-2 text-white/70 tabular-nums">
+                  bbox: <span className="text-white/90 font-semibold">{heroKpi.bboxes}</span>
+                </span>
+                <span className="rounded-2xl border border-white/10 bg-black/25 px-3 py-2 text-white/70 tabular-nums">
+                  ok: <span className="text-emerald-200 font-semibold">{heroKpi.ok}</span>
+                </span>
+                <span className="rounded-2xl border border-white/10 bg-black/25 px-3 py-2 text-white/70 tabular-nums">
+                  defect: <span className="text-orange-200 font-semibold">{heroKpi.defect}</span>
+                </span>
+                <span className="rounded-2xl border border-white/10 bg-black/25 px-3 py-2 text-white/70 tabular-nums">
+                  решений: <span className="text-white/90 font-semibold">{heroKpi.decidedCount}</span>
+                </span>
+                <span className="rounded-2xl border border-white/10 bg-black/25 px-3 py-2 text-white/70 tabular-nums">
+                  без решения: <span className="text-white/90 font-semibold">{heroKpi.unresolvedCount}</span>
+                </span>
               </div>
             </div>
 
-            <div className="mt-6 grid grid-cols-1 md:grid-cols-4 gap-3">
-              <div className="rounded-3xl border border-white/10 bg-black/20 p-4">
-                <div className="text-xs text-white/60">ОК</div>
-                <div className="mt-1 text-xl font-semibold tabular-nums text-emerald-200">{heroKpi.ok}</div>
-              </div>
-              <div className="rounded-3xl border border-white/10 bg-black/20 p-4">
-                <div className="text-xs text-white/60">Есть дефект</div>
-                <div className="mt-1 text-xl font-semibold tabular-nums text-orange-200">{heroKpi.defect}</div>
-              </div>
-              <div className="rounded-3xl border border-white/10 bg-black/20 p-4">
-                <div className="text-xs text-white/60">Риски split</div>
-                <div className="mt-1 text-xl font-semibold tabular-nums">
-                  {datasetDiag.ok ? <span className="text-emerald-200">0</span> : <span className="text-orange-200">{datasetDiag.warnings.length}</span>}
-                </div>
-              </div>
-              <div className="rounded-3xl border border-white/10 bg-black/20 p-4">
-                <div className="text-xs text-white/60">Обучение</div>
-                <div className="mt-1 text-xl font-semibold tabular-nums">
-                  {trainStatus === "running" || trainStatus === "queued" ? (
-                    <span className="text-orange-200">{Math.round(trainProgress)}%</span>
-                  ) : trainStatus === "done" ? (
-                    <span className="text-emerald-200">готово</span>
-                  ) : trainStatus === "error" ? (
-                    <span className="text-red-200">ошибка</span>
-                  ) : (
-                    <span className="text-white/70">—</span>
-                  )}
-                </div>
-              </div>
+            <div className="flex flex-wrap gap-2">
+              <Button variant="secondary" onClick={() => nav("/upload")}>
+                Загрузка
+              </Button>
+              <Button variant="secondary" leftIcon={<Wand2 className="h-4 w-4" />} onClick={() => nav("/viewer")}>
+                Разметка
+              </Button>
+              <Button variant="secondary" onClick={() => nav("/summary")}>
+                Итоги
+              </Button>
             </div>
           </div>
         </div>
 
-        {/* ===== LAYOUT ===== */}
-        <div className="mt-6 grid grid-cols-1 xl:grid-cols-[360px_1fr] gap-4">
-          {/* LEFT sticky nav */}
-          <div className="xl:sticky xl:top-[84px] h-fit">
-            <div className="rounded-3xl border border-white/10 bg-ink-900/55 backdrop-blur-xl shadow-[0_22px_90px_rgba(0,0,0,0.45)] p-4">
-              <div className="text-xs text-white/60 mb-3">Быстрый доступ</div>
-              <div className="space-y-2">
-                <ScrollLink toId="sec-train" label="Обучение модели" icon={<Brain className="h-4 w-4" />} />
-                <ScrollLink toId="sec-ml" label="Модель и веса" icon={<Cpu className="h-4 w-4" />} />
-                <ScrollLink toId="sec-classes" label="Классы (rename)" icon={<Tag className="h-4 w-4" />} />
-                <ScrollLink toId="sec-dataset" label="Диагностика датасета" icon={<Database className="h-4 w-4" />} />
-              </div>
-
-              <div className="mt-4 rounded-3xl border border-orange-300/10 bg-orange-500/[0.05] p-4">
-                <div className="text-sm font-semibold text-white/85">Порядок действий</div>
-                <div className="mt-1 text-xs text-white/60 leading-relaxed">
-                  1) Разметь фото → 2) Нажми “Обучить модель” → 3) После done проверь веса в “Модель и текущие веса”.
+        {/* ===== TRAIN ===== */}
+        <Card
+          title="Обучение модели"
+          icon={<Brain className="h-5 w-5" />}
+          right={
+            <div className="flex items-center gap-2">
+              <span className={["inline-flex items-center rounded-full border px-2 py-1 text-xs font-semibold", trainBadge.cls].join(" ")}>
+                {trainBadge.text}
+              </span>
+              <Button
+                size="sm"
+                variant="primary"
+                leftIcon={<Play className="h-4 w-4" />}
+                disabled={!canTrain || trainBusy}
+                title={!sessionId ? "Нет sessionId" : heroKpi.decidedCount < 1 ? "Нужно хотя бы одно решение" : "Запустить обучение"}
+                onClick={() => void startTrainFlow()}
+              >
+                {trainBusy ? "Идёт…" : "Обучить"}
+              </Button>
+              <Button size="sm" variant="secondary" onClick={() => setTrainOpen(true)} disabled={train.status === "idle"}>
+                Статус
+              </Button>
+            </div>
+          }
+        >
+          <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="text-sm text-white/80 whitespace-pre-line">{train.message || "Нажми “Обучить”, чтобы начать."}</div>
+                <div className="mt-2 text-xs text-white/50 tabular-nums">
+                  {train.jobId ? <span>job: {train.jobId}</span> : <span>job: —</span>}
+                  <span className="mx-2 text-white/25">•</span>
+                  {train.epochsTotal > 0 ? (
+                    <span>
+                      эпоха {train.epoch}/{train.epochsTotal}
+                      {train.batchesTotal > 0 && train.batch > 0 ? <span> • батч {train.batch}/{train.batchesTotal}</span> : null}
+                    </span>
+                  ) : (
+                    <span>эпоха: —</span>
+                  )}
                 </div>
               </div>
+              <div className="text-xs text-white/60 tabular-nums">{Math.round(train.progress)}%</div>
             </div>
+
+            <div className="mt-3">
+              <ProgressBar value={train.progress} />
+            </div>
+
+            {!sessionId ? <div className="mt-3 text-xs text-orange-200">⚠️ Нет sessionId — вернись на “Загрузка”.</div> : null}
+            {sessionId && heroKpi.decidedCount < 1 ? (
+              <div className="mt-3 text-xs text-orange-200">⚠️ Нужно хотя бы одно решение в “Разметка”.</div>
+            ) : null}
+          </div>
+        </Card>
+
+        {/* ===== ML ===== */}
+        <Card
+          title="Модель и веса"
+          icon={<Cpu className="h-5 w-5" />}
+          right={
+            <div className="flex items-center gap-2">
+              <div className={["h-2.5 w-2.5 rounded-full border", statusDot].join(" ")} title={mlHealthErr ? "Ошибка" : mlHealth ? "ОК" : "—"} />
+              <Button
+                size="sm"
+                variant="secondary"
+                leftIcon={<RefreshCw className={["h-4 w-4", mlHealthBusy ? "animate-spin" : ""].join(" ")} />}
+                onClick={() => void loadMlHealth()}
+                disabled={mlHealthBusy || mlReloadBusy}
+              >
+                Обновить
+              </Button>
+              <Button
+                size="sm"
+                variant="primary"
+                leftIcon={<Wand2 className={["h-4 w-4", mlReloadBusy ? "animate-pulse" : ""].join(" ")} />}
+                onClick={() => void reloadWeights()}
+                disabled={mlReloadBusy}
+                title="health/ml?load=true — перезагрузка модели/весов на бэке"
+              >
+                {mlReloadBusy ? "…" : "Перезагрузить"}
+              </Button>
+            </div>
+          }
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-white/55">
+            <div className="min-w-0 truncate">
+              endpoint: <span className="text-white/75">{api.baseUrl}/health/ml</span>
+            </div>
+            <div className="tabular-nums">{updatedLabel}</div>
           </div>
 
-          {/* RIGHT content */}
-          <div className="min-w-0 flex flex-col gap-4">
-            {/* ===== TRAIN ===== */}
-            <div
-              id="sec-train"
-              className="rounded-[32px] border border-white/10 bg-ink-900/55 backdrop-blur-xl shadow-[0_30px_120px_rgba(0,0,0,.55)] overflow-hidden"
-            >
-              <div className="relative p-6">
-                <div className="pointer-events-none absolute inset-0">
-                  <div className="absolute -top-24 left-10 h-72 w-72 rounded-full bg-orange-500/10 blur-3xl" />
-                  <div className="absolute -top-24 right-10 h-72 w-72 rounded-full bg-emerald-400/8 blur-3xl" />
-                  <div className="absolute inset-0 bg-gradient-to-r from-white/[0.02] via-transparent to-white/[0.02]" />
+          {mlHealthErr ? (
+            <div className="mt-3 rounded-2xl border border-rose-300/20 bg-rose-500/10 p-3 text-sm text-rose-200">{mlHealthErr}</div>
+          ) : null}
+
+          <div className="mt-4 rounded-2xl border border-white/10 bg-black/20 p-4">
+            <div className="text-[11px] text-white/50">weights path</div>
+            <div className="mt-2 text-sm font-semibold text-white/85 break-words">{weightsPath || "—"}</div>
+
+            <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div className="rounded-2xl border border-white/10 bg-black/25 p-3">
+                <div className="text-[11px] text-white/50">sha</div>
+                <div className="mt-1 text-sm font-semibold text-white/85 tabular-nums inline-flex items-center gap-2">
+                  <Hash className="h-4 w-4 text-white/45" /> {shortSha(sha)}
                 </div>
+              </div>
 
-                <div className="relative flex items-start justify-between gap-3 flex-wrap">
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2">
-                      <Brain className="h-5 w-5 text-white/70" />
-                      <div className="text-lg font-semibold">Обучение модели</div>
-                    </div>
-                    <div className="mt-1 text-sm text-white/60">
-                      Авто-флоу: sync labels → старт обучения → статус/прогресс. Можно закрыть окно — процесс продолжится.
-                    </div>
-                  </div>
-
-                  <div className="flex items-center gap-2">
-                    <Button
-                      variant="primary"
-                      leftIcon={<Play className="h-4 w-4" />}
-                      disabled={!canTrain || trainBusy}
-                      title={!sessionId ? "Нет sessionId" : decidedCount < 1 ? "Нужно хотя бы одно решение" : "Запустить обучение"}
-                      onClick={() => void startTrainFlow()}
-                    >
-                      {trainBusy ? "Обучаем…" : "Обучить модель"}
-                    </Button>
-
-                    <Button
-                      variant="secondary"
-                      leftIcon={<Wand2 className="h-4 w-4" />}
-                      onClick={() => setTrainOpen(true)}
-                      disabled={trainStatus === "idle"}
-                      title="Открыть окно статуса"
-                    >
-                      Статус
-                    </Button>
-                  </div>
+              <div className="rounded-2xl border border-white/10 bg-black/25 p-3">
+                <div className="text-[11px] text-white/50">mtime</div>
+                <div className="mt-1 text-sm font-semibold text-white/85 tabular-nums inline-flex items-center gap-2">
+                  <Clock className="h-4 w-4 text-white/45" /> {mtimeFromNs(mtimeNs)}
                 </div>
+              </div>
 
-                <div className="relative mt-4 rounded-3xl border border-white/10 bg-black/20 p-5">
-                  <div className="flex items-center justify-between gap-3 flex-wrap">
-                    <div className="flex items-center gap-2">
-                      <span className={["inline-flex items-center gap-2 rounded-2xl border px-3 py-2 text-xs font-semibold", lastTrainBadge.cls].join(" ")}>
-                        {lastTrainBadge.text}
-                      </span>
-                      {trainJobId ? <span className="text-xs text-white/55 tabular-nums">job: {trainJobId}</span> : null}
-                    </div>
+              <div className="rounded-2xl border border-white/10 bg-black/25 p-3">
+                <div className="text-[11px] text-white/50">size</div>
+                <div className="mt-1 text-sm font-semibold text-white/85 tabular-nums inline-flex items-center gap-2">
+                  <HardDrive className="h-4 w-4 text-white/45" /> {fmtBytes(size)}
+                </div>
+              </div>
 
-                    <div className="text-xs text-white/55 tabular-nums">
-                      {trainEpochsTotal > 0 ? (
-                        <>
-                          эпоха {trainEpoch}/{trainEpochsTotal}
-                          {trainBatchesTotal > 0 && trainBatch > 0 ? (
-                            <span className="text-white/45"> • батч {trainBatch}/{trainBatchesTotal}</span>
-                          ) : null}
-                        </>
-                      ) : (
-                        "—"
-                      )}
-                    </div>
-                  </div>
-
-                  <div className="mt-3">
-                    <ProgressBar value={trainProgress} />
-                  </div>
-
-                  <div className="mt-3 text-sm text-white/70 whitespace-pre-line">
-                    {trainMessage ? trainMessage : "Нажми “Обучить модель”, чтобы начать."}
-                  </div>
-
-                  {!sessionId ? (
-                    <div className="mt-3 text-xs text-orange-200">
-                      ⚠️ Нет sessionId — обучение недоступно. Перейди на “Загрузка” и загрузи фото заново.
-                    </div>
+              <div className="rounded-2xl border border-white/10 bg-black/25 p-3">
+                <div className="text-[11px] text-white/50">device</div>
+                <div className="mt-1 text-sm font-semibold text-white/85 tabular-nums inline-flex items-center gap-2">
+                  <Cpu className="h-4 w-4 text-white/45" /> {device || "—"}
+                  {typeof useSeg === "boolean" ? (
+                    <span className="ml-2 text-[11px] font-semibold text-white/55">
+                      seg: <span className="text-white/80">{useSeg ? "on" : "off"}</span>
+                    </span>
                   ) : null}
                 </div>
               </div>
             </div>
 
-            {/* ===== ML ===== */}
-            <div
-              id="sec-ml"
-              className="rounded-[32px] border border-white/10 bg-ink-900/55 backdrop-blur-xl shadow-[0_30px_120px_rgba(0,0,0,.55)] overflow-hidden"
+            <div className="mt-3 text-xs text-white/55">
+              После обучения здесь должны измениться mtime/sha/size — это быстрый способ проверить, что model.pt обновился.
+            </div>
+          </div>
+        </Card>
+
+        {/* ===== CLASSES ===== */}
+        <Card
+          title="Классы (rename)"
+          icon={<Tag className="h-5 w-5" />}
+          right={
+            <Button
+              size="sm"
+              variant="secondary"
+              leftIcon={<RefreshCw className={["h-4 w-4", clsBusy ? "animate-spin" : ""].join(" ")} />}
+              onClick={() => void loadClasses()}
+              disabled={clsBusy}
+              title="Перезагрузить список классов"
             >
-              <div className="relative p-6">
-                <div className="pointer-events-none absolute inset-0">
-                  <div className="absolute -top-24 left-10 h-64 w-64 rounded-full bg-emerald-400/8 blur-3xl" />
-                  <div className="absolute -top-24 right-10 h-72 w-72 rounded-full bg-orange-500/10 blur-3xl" />
-                  <div className="absolute inset-0 bg-gradient-to-r from-white/[0.02] via-transparent to-white/[0.02]" />
+              Обновить
+            </Button>
+          }
+        >
+          <div className="flex items-center justify-between gap-3 text-xs text-white/55">
+            <div>
+              Всего: <span className="text-white/85 tabular-nums font-semibold">{classes.length}</span>
+            </div>
+            <div className="text-white/40">Нажми ✎ чтобы переименовать</div>
+          </div>
+
+          <div className="mt-3 rounded-2xl border border-white/10 bg-black/20">
+            <div className="max-h-[360px] overflow-auto no-scrollbar p-2">
+              {classes.length ? (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {classes.map((c) => (
+                    <div key={c} className="rounded-2xl border border-white/10 bg-white/[0.02] p-3 flex items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="text-sm font-semibold text-white/85 truncate">{c}</div>
+                        <div className="text-[11px] text-white/45 truncate">key: {normKey(c)}</div>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => openRename(c)}
+                        className="shrink-0 h-10 w-10 rounded-2xl border border-white/10 bg-white/[0.03] hover:bg-white/[0.06] transition flex items-center justify-center"
+                        title="Переименовать"
+                      >
+                        <Pencil className="h-4 w-4 text-white/75" />
+                      </button>
+                    </div>
+                  ))}
                 </div>
+              ) : (
+                <div className="p-4 text-sm text-white/60">Классы не найдены.</div>
+              )}
+            </div>
+          </div>
 
-                <div className="relative flex items-start justify-between gap-3 flex-wrap">
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2">
-                      <Cpu className="h-5 w-5 text-white/70" />
-                      <div className="text-lg font-semibold">Модель и текущие веса</div>
-                    </div>
-                    <div className="mt-1 text-sm text-white/60">
-                      Источник: <span className="text-white/75">{api.baseUrl}/health/ml</span> • авто-обновление 30с
-                    </div>
-                    <div className="mt-2 text-[11px] text-white/45">{updatedLabel}</div>
+          {!sessionId ? <div className="mt-3 text-xs text-orange-200">⚠️ Нет sessionId — rename в бэке недоступен, будет только локально.</div> : null}
+        </Card>
+
+        {/* ===== DATASET ===== */}
+        <Card
+          title="Диагностика датасета (train/val)"
+          icon={<Database className="h-5 w-5" />}
+          right={
+            <div
+              className={[
+                "inline-flex items-center gap-2 rounded-2xl border px-3 py-2 text-xs font-semibold",
+                datasetDiag.ok ? "border-emerald-300/20 bg-emerald-500/10 text-emerald-200" : "border-orange-300/20 bg-orange-500/10 text-orange-200",
+              ].join(" ")}
+            >
+              {datasetDiag.ok ? <CheckCircle2 className="h-4 w-4" /> : <AlertTriangle className="h-4 w-4" />}
+              {datasetDiag.ok ? "ОК" : "Есть риски"}
+            </div>
+          }
+        >
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
+              <div className="flex items-center justify-between gap-3">
+                <div className="text-sm font-semibold text-white/85">Split</div>
+                <div className="text-xs text-white/55 tabular-nums">
+                  train {datasetDiag.images.train} ({trainPct}%) • val {datasetDiag.images.val} ({valPct}%)
+                </div>
+              </div>
+
+              <div className="mt-3 space-y-3">
+                <div>
+                  <div className="flex items-center justify-between text-xs text-white/55">
+                    <span>train</span>
+                    <span className="tabular-nums">{datasetDiag.images.train}</span>
                   </div>
-
-                  <div className="flex items-center gap-2">
-                    <div className={["h-2.5 w-2.5 rounded-full border", statusDot].join(" ")} />
-
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      leftIcon={<RefreshCw className={["h-4 w-4", mlHealthBusy ? "animate-spin" : ""].join(" ")} />}
-                      onClick={() => void loadMlHealth()}
-                      disabled={mlHealthBusy || mlReloadBusy}
-                    >
-                      Обновить
-                    </Button>
-
-                    <Button
-                      size="sm"
-                      variant="primary"
-                      leftIcon={<Wand2 className={["h-4 w-4", mlReloadBusy ? "animate-pulse" : ""].join(" ")} />}
-                      onClick={() => void reloadWeights()}
-                      disabled={mlReloadBusy}
-                      title="health/ml?load=true — перезагрузка модели/весов на бэке"
-                    >
-                      {mlReloadBusy ? "Перезагружаем…" : "Перезагрузить веса"}
-                    </Button>
+                  <div className="mt-2">
+                    <ProgressBar value={trainPct} />
                   </div>
                 </div>
-
-                {mlHealthErr ? (
-                  <div className="relative mt-4 rounded-2xl border border-rose-300/20 bg-rose-500/10 p-4 text-sm text-rose-200">
-                    {mlHealthErr}
+                <div>
+                  <div className="flex items-center justify-between text-xs text-white/55">
+                    <span>val</span>
+                    <span className="tabular-nums">{datasetDiag.images.val}</span>
                   </div>
-                ) : null}
-
-                <div className="relative mt-4 rounded-3xl border border-white/10 bg-black/20 p-5">
-                  <div className="text-xs text-white/60">weights path</div>
-                  <div className="mt-2 text-[13px] md:text-sm font-semibold text-white/85 break-words">{weightsPath || "—"}</div>
-
-                  <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-3">
-                    <div className="rounded-3xl border border-white/10 bg-black/25 p-4">
-                      <div className="text-[11px] text-white/55">sha</div>
-                      <div className="mt-1 text-sm font-semibold text-white/85 tabular-nums inline-flex items-center gap-2">
-                        <Hash className="h-4 w-4 text-white/50" /> {shortSha(sha)}
-                      </div>
-                    </div>
-
-                    <div className="rounded-3xl border border-white/10 bg-black/25 p-4">
-                      <div className="text-[11px] text-white/55">mtime</div>
-                      <div className="mt-1 text-sm font-semibold text-white/85 tabular-nums inline-flex items-center gap-2">
-                        <Clock className="h-4 w-4 text-white/50" /> {mtimeFromNs(mtimeNs)}
-                      </div>
-                    </div>
-
-                    <div className="rounded-3xl border border-white/10 bg-black/25 p-4">
-                      <div className="text-[11px] text-white/55">size</div>
-                      <div className="mt-1 text-sm font-semibold text-white/85 tabular-nums inline-flex items-center gap-2">
-                        <HardDrive className="h-4 w-4 text-white/50" /> {fmtBytes(size)}
-                      </div>
-                    </div>
-
-                    <div className="rounded-3xl border border-white/10 bg-black/25 p-4">
-                      <div className="text-[11px] text-white/55">device</div>
-                      <div className="mt-1 text-sm font-semibold text-white/85 tabular-nums inline-flex items-center gap-2">
-                        <Cpu className="h-4 w-4 text-white/50" /> {device || "—"}
-                        {typeof useSeg === "boolean" ? (
-                          <span className="ml-2 text-[11px] font-semibold text-white/55">
-                            seg: <span className="text-white/80">{useSeg ? "on" : "off"}</span>
-                          </span>
-                        ) : null}
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="mt-4 text-xs text-white/55">
-                    После обучения model.pt перезаписывается — тут видно новый mtime/sha/size. Если веса меняются — будет toast “✅ Веса модели обновились”.
+                  <div className="mt-2">
+                    <ProgressBar value={valPct} />
                   </div>
                 </div>
               </div>
+
+              {datasetDiag.warnings.length ? (
+                <div className="mt-3 rounded-2xl border border-orange-300/20 bg-orange-500/10 p-3">
+                  <div className="text-xs font-semibold text-orange-200">Предупреждения</div>
+                  <ul className="mt-2 space-y-1 text-xs text-white/70">
+                    {datasetDiag.warnings.map((w, i) => (
+                      <li key={i} className="flex items-start gap-2">
+                        <span className="mt-[2px] h-1.5 w-1.5 rounded-full bg-orange-300/70 shrink-0" />
+                        <span className="leading-snug">{w}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : (
+                <div className="mt-3 text-xs text-emerald-200">✅ Split выглядит корректно.</div>
+              )}
             </div>
 
-            {/* ===== CLASSES ===== */}
-            <div
-              id="sec-classes"
-              className="rounded-[32px] border border-white/10 bg-ink-900/55 backdrop-blur-xl shadow-[0_30px_120px_rgba(0,0,0,.55)] overflow-hidden"
-            >
-              <div className="relative p-6">
-                <div className="pointer-events-none absolute inset-0">
-                  <div className="absolute -top-24 left-16 h-72 w-72 rounded-full bg-orange-500/10 blur-3xl" />
-                  <div className="absolute -top-28 right-8 h-80 w-80 rounded-full bg-white/[0.04] blur-3xl" />
-                  <div className="absolute inset-0 bg-gradient-to-r from-white/[0.02] via-transparent to-white/[0.02]" />
+            <div className="rounded-2xl border border-white/10 bg-black/20 p-4">
+              <div className="flex items-center justify-between gap-3">
+                <div className="text-sm font-semibold text-white/85">Классы по bbox</div>
+                <div className="text-xs text-white/55 tabular-nums">
+                  bbox train {datasetDiag.boxes.train} • val {datasetDiag.boxes.val}
+                </div>
+              </div>
+
+              <div className="mt-3 max-h-[320px] overflow-auto no-scrollbar rounded-2xl border border-white/10">
+                <div className="grid grid-cols-[1fr_86px_86px] gap-2 px-3 py-2 text-[11px] uppercase tracking-wide text-white/45 bg-black/25 sticky top-0">
+                  <div>Класс</div>
+                  <div className="text-right">train</div>
+                  <div className="text-right">val</div>
                 </div>
 
-                <div className="relative flex items-start justify-between gap-3 flex-wrap">
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2">
-                      <Tag className="h-5 w-5 text-white/70" />
-                      <div className="text-lg font-semibold">Классы дефектов</div>
-                    </div>
-                    <div className="mt-1 text-sm text-white/60">Rename обновит: список классов, bbox на фото, решения оператора.</div>
-                  </div>
-
-                  <div className="flex items-center gap-2">
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      leftIcon={<RefreshCw className={["h-4 w-4", clsBusy ? "animate-spin" : ""].join(" ")} />}
-                      onClick={() => void loadClasses()}
-                      disabled={clsBusy}
-                      title="Перезагрузить список классов"
-                    >
-                      Обновить
-                    </Button>
-                  </div>
-                </div>
-
-                <div className="relative mt-4 rounded-3xl border border-white/10 bg-black/20 overflow-hidden">
-                  <div className="px-4 py-3 bg-black/25 border-b border-white/10 flex items-center justify-between">
-                    <div className="text-xs text-white/60">
-                      Всего: <span className="text-white/80 tabular-nums">{classes.length}</span>
-                    </div>
-                    <div className="text-[11px] text-white/50">Нажми ✎ чтобы переименовать</div>
-                  </div>
-
-                  <div className="max-h-[360px] overflow-auto no-scrollbar p-2">
-                    {classes.length ? (
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                        {classes.map((c) => (
-                          <div
-                            key={c}
-                            className="rounded-3xl border border-white/10 bg-white/[0.02] p-3 flex items-center justify-between gap-2"
-                          >
-                            <div className="min-w-0">
-                              <div className="text-sm font-semibold text-white/85 truncate">{c}</div>
-                              <div className="text-[11px] text-white/45 truncate">key: {normKey(c)}</div>
-                            </div>
-
-                            <button
-                              type="button"
-                              onClick={() => openRename(c)}
-                              className="shrink-0 h-10 w-10 rounded-2xl border border-white/10 bg-white/[0.03] hover:bg-white/[0.06] transition flex items-center justify-center"
-                              title="Переименовать"
-                            >
-                              <Pencil className="h-4 w-4 text-white/75" />
-                            </button>
+                {datasetDiag.classRows.length ? (
+                  <div className="p-2 space-y-1">
+                    {datasetDiag.classRows.map((r) => {
+                      const onlyTrain = r.train > 0 && r.val === 0;
+                      const onlyVal = r.val > 0 && r.train === 0;
+                      return (
+                        <div
+                          key={r.cls}
+                          className={[
+                            "grid grid-cols-[1fr_86px_86px] gap-2 items-center px-2 py-2 rounded-2xl border",
+                            onlyTrain
+                              ? "border-orange-300/20 bg-orange-500/8"
+                              : onlyVal
+                              ? "border-red-300/20 bg-red-500/8"
+                              : "border-white/5 bg-white/[0.02]",
+                          ].join(" ")}
+                        >
+                          <div className="min-w-0">
+                            <div className="text-sm font-semibold text-white/85 truncate">{r.cls}</div>
+                            {onlyTrain ? (
+                              <div className="text-[11px] text-orange-200/90">только train</div>
+                            ) : onlyVal ? (
+                              <div className="text-[11px] text-red-200/90">только val</div>
+                            ) : (
+                              <div className="text-[11px] text-white/45">train+val</div>
+                            )}
                           </div>
-                        ))}
-                      </div>
-                    ) : (
-                      <div className="p-4 text-sm text-white/60">Классы не найдены.</div>
-                    )}
+                          <div className="text-right text-sm text-white/75 tabular-nums">{r.train}</div>
+                          <div className="text-right text-sm text-white/75 tabular-nums">{r.val}</div>
+                        </div>
+                      );
+                    })}
                   </div>
-                </div>
-
-                <div className="relative mt-4 rounded-3xl border border-orange-300/10 bg-orange-500/[0.05] p-4">
-                  <div className="text-sm font-semibold text-white/85">Правило консистентности</div>
-                  <div className="mt-1 text-xs text-white/60 leading-relaxed">
-                    Rename — это не только UI:
-                    <br />• фронт: bbox/decisions (готово)
-                    <br />• бэк: session JSON + classes, чтобы после F5 всё сохранилось (следующий шаг).
+                ) : (
+                  <div className="p-4 text-sm text-white/60">
+                    Пока нет bbox для сравнения. Нужны фото с решением “Есть дефект” и хотя бы одним bbox.
                   </div>
-                </div>
+                )}
               </div>
-            </div>
 
-            {/* ===== DATASET ===== */}
-            <div
-              id="sec-dataset"
-              className="rounded-[32px] border border-white/10 bg-ink-900/55 backdrop-blur-xl shadow-[0_30px_120px_rgba(0,0,0,.55)] overflow-hidden"
-            >
-              <div className="relative p-6">
-                <div className="pointer-events-none absolute inset-0">
-                  <div className="absolute -top-28 left-8 h-80 w-80 rounded-full bg-amber-300/10 blur-3xl" />
-                  <div className="absolute -top-24 right-10 h-72 w-72 rounded-full bg-emerald-400/8 blur-3xl" />
-                  <div className="absolute inset-0 bg-gradient-to-r from-white/[0.02] via-transparent to-white/[0.02]" />
-                </div>
-
-                <div className="relative flex items-start justify-between gap-3 flex-wrap">
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2">
-                      <Database className="h-5 w-5 text-white/70" />
-                      <div className="text-lg font-semibold">Диагностика датасета</div>
-                    </div>
-                    <div className="mt-1 text-sm text-white/60">
-                      Разбиение train/val как на бэке. Риски по val + распределение классов.
-                    </div>
-                  </div>
-
-                  <div
-                    className={[
-                      "shrink-0 inline-flex items-center gap-2 rounded-2xl border px-3 py-2 text-xs font-semibold",
-                      datasetDiag.ok ? "border-emerald-300/20 bg-emerald-500/10 text-emerald-200" : "border-orange-300/20 bg-orange-500/10 text-orange-200",
-                    ].join(" ")}
-                  >
-                    {datasetDiag.ok ? <CheckCircle2 className="h-4 w-4" /> : <AlertTriangle className="h-4 w-4" />}
-                    {datasetDiag.ok ? "ОК" : "Есть риски"}
-                  </div>
-                </div>
-
-                <div className="relative mt-5 grid grid-cols-1 lg:grid-cols-2 gap-4">
-                  {/* split card */}
-                  <div className="rounded-[28px] border border-white/10 bg-black/20 p-5">
-                    <div className="flex items-center justify-between gap-3">
-                      <div className="text-sm font-semibold text-white/85">Разбиение</div>
-                      <div className="text-xs text-white/55 tabular-nums">
-                        train {datasetDiag.images.train} • val {datasetDiag.images.val}
-                      </div>
-                    </div>
-
-                    <div className="mt-4 space-y-3">
-                      <div>
-                        <div className="flex items-center justify-between text-xs text-white/55">
-                          <span>Изображения в train</span>
-                          <span className="tabular-nums">{datasetDiag.images.train}</span>
-                        </div>
-                        <div className="mt-2">
-                          <ProgressBar
-                            value={
-                              datasetDiag.images.train + datasetDiag.images.val > 0
-                                ? Math.round((datasetDiag.images.train / (datasetDiag.images.train + datasetDiag.images.val)) * 100)
-                                : 0
-                            }
-                          />
-                        </div>
-                      </div>
-
-                      <div>
-                        <div className="flex items-center justify-between text-xs text-white/55">
-                          <span>Изображения в val</span>
-                          <span className="tabular-nums">{datasetDiag.images.val}</span>
-                        </div>
-                        <div className="mt-2">
-                          <ProgressBar
-                            value={
-                              datasetDiag.images.train + datasetDiag.images.val > 0
-                                ? Math.round((datasetDiag.images.val / (datasetDiag.images.train + datasetDiag.images.val)) * 100)
-                                : 0
-                            }
-                          />
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="mt-3 text-xs text-white/55 leading-relaxed">
-                      {datasetDiag.images.val === 0 ? (
-                        <span className="text-orange-200">⚠️ В val нет изображений — обучение может упасть.</span>
-                      ) : datasetDiag.labeledPhotos.val === 0 ? (
-                        <span className="text-orange-200">⚠️ В val нет bbox — метрики валидации будут “пустые”.</span>
-                      ) : (
-                        <span className="text-emerald-200">✅ Split выглядит корректно.</span>
-                      )}
-                    </div>
-                  </div>
-
-                  {/* classes card */}
-                  <div className="rounded-[28px] border border-white/10 bg-black/20 p-5">
-                    <div className="flex items-center gap-2">
-                      <Layers className="h-5 w-5 text-white/70" />
-                      <div className="text-sm font-semibold text-white/85">Классы в train vs val (по bbox)</div>
-                    </div>
-
-                    {datasetDiag.warnings.length ? (
-                      <div className="mt-3 rounded-2xl border border-orange-300/20 bg-orange-500/10 p-3">
-                        <div className="text-xs font-semibold text-orange-200">Предупреждения</div>
-                        <ul className="mt-2 space-y-1 text-xs text-white/70">
-                          {datasetDiag.warnings.map((w, i) => (
-                            <li key={i} className="flex items-start gap-2">
-                              <span className="mt-[2px] h-1.5 w-1.5 rounded-full bg-orange-300/70 shrink-0" />
-                              <span className="leading-snug">{w}</span>
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    ) : (
-                      <div className="mt-3 rounded-2xl border border-emerald-300/20 bg-emerald-500/10 p-3 text-xs text-emerald-200">
-                        Всё выглядит нормально: и val заполнен, и классы распределены.
-                      </div>
-                    )}
-
-                    <div className="mt-4 max-h-[320px] overflow-auto no-scrollbar rounded-2xl border border-white/10">
-                      <div className="grid grid-cols-[1fr_86px_86px] gap-2 px-3 py-2 text-[11px] uppercase tracking-wide text-white/45 bg-black/25 sticky top-0">
-                        <div>Класс</div>
-                        <div className="text-right">train</div>
-                        <div className="text-right">val</div>
-                      </div>
-
-                      {datasetDiag.classRows.length ? (
-                        <div className="p-2 space-y-1">
-                          {datasetDiag.classRows.map((r) => {
-                            const onlyTrain = r.train > 0 && r.val === 0;
-                            const onlyVal = r.val > 0 && r.train === 0;
-                            return (
-                              <div
-                                key={r.cls}
-                                className={[
-                                  "grid grid-cols-[1fr_86px_86px] gap-2 items-center px-2 py-2 rounded-2xl border",
-                                  onlyTrain
-                                    ? "border-orange-300/20 bg-orange-500/8"
-                                    : onlyVal
-                                    ? "border-red-300/20 bg-red-500/8"
-                                    : "border-white/5 bg-white/[0.02]",
-                                ].join(" ")}
-                              >
-                                <div className="min-w-0">
-                                  <div className="text-sm font-semibold text-white/85 truncate">{r.cls}</div>
-                                  {onlyTrain ? (
-                                    <div className="text-[11px] text-orange-200/90">только train</div>
-                                  ) : onlyVal ? (
-                                    <div className="text-[11px] text-red-200/90">только val</div>
-                                  ) : (
-                                    <div className="text-[11px] text-white/45">train+val</div>
-                                  )}
-                                </div>
-                                <div className="text-right text-sm text-white/75 tabular-nums">{r.train}</div>
-                                <div className="text-right text-sm text-white/75 tabular-nums">{r.val}</div>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      ) : (
-                        <div className="p-4 text-sm text-white/60">
-                          Пока нет bbox для сравнения. Нужны фото с решением “Есть дефект” и хотя бы одним bbox.
-                        </div>
-                      )}
-                    </div>
-
-                    <div className="mt-3 text-xs text-white/55">
-                      Если класс есть только в train — валидация его не покажет, пока он не появится в val хотя бы в одном bbox.
-                    </div>
-                  </div>
-                </div>
-
-                {!items.length ? (
-                  <div className="relative mt-4 rounded-3xl border border-white/10 bg-black/20 p-5 text-sm text-white/60">
-                    Пока нет фото. Перейди на “Загрузка” и добавь изображения.
-                    <div className="mt-3">
-                      <Button variant="primary" onClick={() => nav("/upload")}>
-                        На загрузку
-                      </Button>
-                    </div>
-                  </div>
-                ) : null}
-              </div>
-            </div>
-
-            {/* bottom CTA */}
-            <div className="rounded-3xl border border-white/10 bg-ink-900/50 backdrop-blur-xl p-5">
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="text-sm text-white/70">
-                  Быстрые переходы: <span className="text-white/85 font-semibold">разметка</span> и{" "}
-                  <span className="text-white/85 font-semibold">итоги</span>.
-                </div>
-                <div className="flex gap-2">
-                  <Button variant="secondary" onClick={() => nav("/upload")}>
-                    Загрузка
-                  </Button>
-                  <Button variant="primary" onClick={() => nav("/viewer")}>
-                    Разметка
-                  </Button>
-                </div>
+              <div className="mt-3 text-xs text-white/55">
+                Если класс есть только в train — валидация его не покажет, пока он не появится в val хотя бы в одном bbox.
               </div>
             </div>
           </div>
-          {/* /RIGHT */}
-        </div>
+
+          {!items.length ? (
+            <div className="mt-4 rounded-2xl border border-white/10 bg-black/20 p-4 text-sm text-white/60">
+              Пока нет фото. Перейди на “Загрузка” и добавь изображения.
+              <div className="mt-3">
+                <Button variant="primary" onClick={() => nav("/upload")}>
+                  На загрузку
+                </Button>
+              </div>
+            </div>
+          ) : null}
+        </Card>
       </div>
     </div>
   );
