@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -89,7 +90,8 @@ def _resolve_weights_path() -> Any:
 
 def _weights_key(weights: Any) -> str:
     """
-    Ключ кэша: путь + mtime_ns + size, чтобы перезапись model.pt вызывала reload.
+    Ключ кэша: путь + mtime_ns + ctime_ns + size.
+    Это делает reload максимально устойчивым даже в ситуациях, когда mtime/size совпали.
     """
     if isinstance(weights, Path):
         try:
@@ -100,23 +102,29 @@ def _weights_key(weights: Any) -> str:
         try:
             st = p.stat()
             mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
-            return f"{str(p)}::mtime_ns={mtime_ns}::size={int(st.st_size)}"
+            ctime_ns = int(getattr(st, "st_ctime_ns", int(st.st_ctime * 1e9)))
+            size = int(st.st_size)
+            return f"{str(p)}::mtime_ns={mtime_ns}::ctime_ns={ctime_ns}::size={size}"
         except Exception:
             return str(p)
 
     return str(weights)
 
 
-def _file_stat_ns(p: Path) -> Tuple[Optional[int], Optional[int]]:
+def _file_stat_ns(p: Path) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """
+    (mtime_ns, size, ctime_ns)
+    """
     try:
         if not p.exists() or not p.is_file():
-            return None, None
+            return None, None, None
         st = p.stat()
         mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+        ctime_ns = int(getattr(st, "st_ctime_ns", int(st.st_ctime * 1e9)))
         size = int(st.st_size)
-        return mtime_ns, size
+        return mtime_ns, size, ctime_ns
     except Exception:
-        return None, None
+        return None, None, None
 
 
 def _sha256_file(p: Path) -> Optional[str]:
@@ -187,6 +195,9 @@ class ModelManager:
             self._names = []
             self._weights_key = ""
             self._use_seg = False
+            # sha cache тоже сбрасываем, чтобы /health/ml не показывал устаревший sha
+            self._sha_cache_key = ""
+            self._sha_cache_value = None
         logger.info("ModelManager.invalidate(): cache cleared")
 
     def is_loaded(self) -> bool:
@@ -273,10 +284,10 @@ class ModelManager:
     def _sha256_cached(self, p: Path) -> Optional[str]:
         """
         sha256 может быть дорогим (особенно если weights большие и /health/ml пуляют часто).
-        Кэшируем по (path, mtime_ns, size).
+        Кэшируем по (path, mtime_ns, ctime_ns, size).
         """
-        mtime_ns, size = _file_stat_ns(p)
-        key = f"{str(p)}::{mtime_ns or ''}::{size or ''}"
+        mtime_ns, size, ctime_ns = _file_stat_ns(p)
+        key = f"{str(p)}::{mtime_ns or ''}::{ctime_ns or ''}::{size or ''}"
         if key and key == self._sha_cache_key:
             return self._sha_cache_value
         sha = _sha256_file(p)
@@ -302,6 +313,7 @@ class ModelManager:
         weights_key_str: Optional[str] = None
         sha256: Optional[str] = None
         mtime_ns: Optional[int] = None
+        ctime_ns: Optional[int] = None
         size: Optional[int] = None
         exists: Optional[bool] = None
 
@@ -312,7 +324,7 @@ class ModelManager:
             if isinstance(resolved_weights, Path):
                 weights_path_str = str(resolved_weights.resolve())
                 exists = bool(resolved_weights.exists() and resolved_weights.is_file())
-                mtime_ns, size = _file_stat_ns(resolved_weights)
+                mtime_ns, size, ctime_ns = _file_stat_ns(resolved_weights)
                 sha256 = self._sha256_cached(resolved_weights)
             else:
                 # строка типа "yolov8n.pt"
@@ -365,6 +377,7 @@ class ModelManager:
             "weights_key": weights_key_str,
             "sha256": sha256,
             "mtime_ns": int(mtime_ns) if isinstance(mtime_ns, int) else None,
+            "ctime_ns": int(ctime_ns) if isinstance(ctime_ns, int) else None,
             "size": int(size) if isinstance(size, int) else None,
             "device": str(resolved_device),
             "use_seg": bool(use_seg),
@@ -398,8 +411,9 @@ class ModelManager:
                     w2 = _resolve_weights_path()
                     if isinstance(w2, Path):
                         out["weights_path"] = str(w2.resolve())
-                        m2, s2 = _file_stat_ns(w2)
+                        m2, s2, c2 = _file_stat_ns(w2)
                         out["mtime_ns"] = int(m2) if isinstance(m2, int) else out.get("mtime_ns")
+                        out["ctime_ns"] = int(c2) if isinstance(c2, int) else out.get("ctime_ns")
                         out["size"] = int(s2) if isinstance(s2, int) else out.get("size")
                         out["sha256"] = self._sha256_cached(w2) or out.get("sha256")
                         out["weights"]["exists"] = bool(w2.exists() and w2.is_file())
