@@ -1,4 +1,4 @@
-// src/pages/UploadPage.tsx
+// frontend/src/pages/UploadPage.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import Button from "../components/ui/Button";
@@ -8,7 +8,7 @@ import { toast } from "../components/ui/ToastCenter";
 import { useAppStore } from "../store/useAppStore";
 import { api } from "../api/api";
 
-type Stage = {
+type SubsystemStage = {
   id: string;
   title: string;
   percent: number;
@@ -294,7 +294,9 @@ export default function UploadPage() {
         ? `top-${Math.max(1, topK)} резких (лимит ${Math.max(1, maxFrames)} кадров)`
         : `по движению (порог ${minMotion.toFixed(2)}, лимит ${Math.max(1, maxFrames)} кадров)`;
 
-    toast.info(`Видео подготовлено (UX). Файлов: ${files.length}. Выборка кадров: ${settings}. Дальше нужен pipeline на бэке.`);
+    toast.info(
+      `Видео подготовлено (UX). Файлов: ${files.length}. Выборка кадров: ${settings}. Дальше нужен pipeline на бэке.`
+    );
   }
 
   // Ctrl+V paste → add images to photo queue
@@ -335,11 +337,43 @@ export default function UploadPage() {
   }, [pendingPhotos.length]);
 
   // ===== project status =====
-  const stages: Stage[] = useMemo(
+  const TOTAL_STAGES = 6;
+  const CURRENT_STAGE = 1;
+  const CURRENT_STAGE_TITLE = "Аудит и стабилизация";
+
+  const stage1Checklist = useMemo(
+    () => [
+      { done: true, text: "Единый API-клиент фронта (sessions/photos/labels/infer/train/classes/report)" },
+      { done: true, text: "Восстановление фото после F5 по sessionId (listPhotos → store)" },
+      { done: true, text: "Устойчивый монитор обучения: неизвестные статусы не ломают UI" },
+      { done: true, text: "Backend: корректное ‘lost after restart’ → status=error + flags" },
+      { done: false, text: "Унифицировать формат ошибок бэка (code/message/details) во всех эндпоинтах" },
+      { done: false, text: "Разнести routes.py по модулям (admin/train/report/infer) и убрать дубли атомарной записи" },
+    ],
+    []
+  );
+
+  const stagePercent = useMemo(() => {
+    const total = stage1Checklist.length || 1;
+    const done = stage1Checklist.filter((x) => x.done).length;
+    return Math.round((done / total) * 100);
+  }, [stage1Checklist]);
+
+  const changelog = useMemo(
+    () => [
+      "19.02.2026 — train status: ‘lost’ больше не ломает фронт (нормализация + fail-safe).",
+      "19.02.2026 — backend: ‘lost after restart’ помечается как error + flags, исправлен баг Path(\"\") → \".\".",
+      "19.02.2026 — улучшен парсинг ошибок API (detail/message в разных формах).",
+      "19.02.2026 — UploadPage: статус проекта приведён к формату Этап X/6 + % + чеклист + прогресс + changelog.",
+    ],
+    []
+  );
+
+  const subsystems: SubsystemStage[] = useMemo(
     () => [
       {
         id: "s1",
-        title: "1) Сессии + загрузка + хранение",
+        title: "Подсистема: Сессии + загрузка + хранение",
         percent: 92,
         bullets: [
           "createSession / upload / listPhotos / restore после F5",
@@ -350,13 +384,13 @@ export default function UploadPage() {
       },
       {
         id: "s2",
-        title: "2) Галерея + навигация",
+        title: "Подсистема: Галерея + навигация",
         percent: 90,
         bullets: ["grid галерея", "переход в просмотр/итог", "стейт activeIndex + персист в sessionStorage"],
       },
       {
         id: "s3",
-        title: "3) Viewer + разметка + YOLO",
+        title: "Подсистема: Viewer + разметка + YOLO",
         percent: 83,
         bullets: [
           "bbox add/edit/delete, хоткеи, зум/пан",
@@ -367,34 +401,29 @@ export default function UploadPage() {
       },
       {
         id: "s4",
-        title: "4) Обучение + статусы + веса",
-        percent: 62,
+        title: "Подсистема: Обучение + статусы + веса",
+        percent: 72,
         bullets: [
           "train job + status по API",
-          "нужно: мониторинг/история обучений (таблица)",
-          "нужно: health ML + device/cuda/cpu fallback",
-          "нужно: стабильный endpoint с метаданными весов (mtime/sha/version)",
+          "монитор обучения в фоне (store), fallback-progress",
+          "устойчивость статуса после рестарта (job store на диске)",
+          "осталось: стабильный endpoint с метаданными весов (mtime/sha/version)",
         ],
       },
       {
         id: "s5",
-        title: "5) Отчёты + админка",
-        percent: 58,
-        bullets: [
-          "Word-отчёт: заполнение таблицы шаблона готово",
-          "админка: веса/health/train jobs/ошибки",
-          "ВАЖНО: переименование классов (редактирование) + автоподтягивание везде",
-          "видео: будущая цепочка выборка кадров → инференс → сводка",
-        ],
+        title: "Подсистема: Отчёты + админка",
+        percent: 68,
+        bullets: ["Word-отчёт: заполнение таблицы шаблона", "админка: веса/health/train jobs/ошибки", "классы: добавление/переименование"],
       },
     ],
     []
   );
 
-  const overall = useMemo(() => {
-    const avg = stages.reduce((s, x) => s + x.percent, 0) / Math.max(1, stages.length);
+  const subsystemsOverall = useMemo(() => {
+    const avg = subsystems.reduce((s, x) => s + x.percent, 0) / Math.max(1, subsystems.length);
     return Math.round(avg);
-  }, [stages]);
+  }, [subsystems]);
 
   const hasPhotos = (photos?.length ?? 0) > 0;
 
@@ -440,13 +469,11 @@ export default function UploadPage() {
   return (
     <div className="h-full w-full">
       <div className="mx-auto max-w-[1200px] px-5 pt-10 pb-10">
-        {/* HERO (теперь без текста/чипсов/шагов) */}
+        {/* HERO */}
         <div className="fx-card fx-glint p-8">
           <div className="flex flex-wrap items-start justify-between gap-4">
             <div className="min-w-0">
-              <div className="text-3xl font-semibold leading-tight">
-                Загрузка
-              </div>
+              <div className="text-3xl font-semibold leading-tight">Загрузка</div>
             </div>
 
             <div className="flex items-center gap-2">
@@ -479,10 +506,7 @@ export default function UploadPage() {
               onDrop={(e) => onDrop("photo", e)}
               onDragEnter={(e) => onDragEnter("photo", e)}
               onDragLeave={(e) => onDragLeave("photo", e)}
-              className={[
-                "fx-card fx-glint fx-border-run p-6 relative",
-                dragPhoto || pastePulse ? "ring-2 ring-orange-300/20" : "",
-              ].join(" ")}
+              className={["fx-card fx-glint fx-border-run p-6 relative", dragPhoto || pastePulse ? "ring-2 ring-orange-300/20" : ""].join(" ")}
             >
               {dragPhoto ? (
                 <div className="absolute inset-0 rounded-[18px] bg-black/40 backdrop-blur-sm flex items-center justify-center z-10">
@@ -496,8 +520,7 @@ export default function UploadPage() {
                 <div className="min-w-0">
                   <div className="text-sm font-semibold text-white/90">Фото</div>
                   <div className="mt-1 text-xs text-white/60">
-                    Перетащи сюда <span className="text-white/75">image/*</span> или{" "}
-                    <span className="text-white/75">Ctrl+V</span> (скриншоты).
+                    Перетащи сюда <span className="text-white/75">image/*</span> или <span className="text-white/75">Ctrl+V</span> (скриншоты).
                   </div>
                   <div className="mt-1 text-[11px] text-white/45">{humanLimits("photo")}</div>
                 </div>
@@ -510,11 +533,7 @@ export default function UploadPage() {
 
               <div className="mt-5 rounded-3xl border border-white/10 bg-black/20 p-5">
                 <div className="flex flex-wrap gap-2">
-                  <Button
-                    variant="primary"
-                    leftIcon={<span className="text-base">📷</span>}
-                    onClick={() => inputPhotoRef.current?.click()}
-                  >
+                  <Button variant="primary" leftIcon={<span className="text-base">📷</span>} onClick={() => inputPhotoRef.current?.click()}>
                     Выбрать файлы
                   </Button>
 
@@ -617,10 +636,7 @@ export default function UploadPage() {
               onDrop={(e) => onDrop("video", e)}
               onDragEnter={(e) => onDragEnter("video", e)}
               onDragLeave={(e) => onDragLeave("video", e)}
-              className={[
-                "fx-card fx-glint fx-border-run p-6 relative",
-                dragVideo ? "ring-2 ring-orange-300/20" : "",
-              ].join(" ")}
+              className={["fx-card fx-glint fx-border-run p-6 relative", dragVideo ? "ring-2 ring-orange-300/20" : ""].join(" ")}
             >
               {dragVideo ? (
                 <div className="absolute inset-0 rounded-[18px] bg-black/40 backdrop-blur-sm flex items-center justify-center z-10">
@@ -647,11 +663,7 @@ export default function UploadPage() {
 
               <div className="mt-5 rounded-3xl border border-white/10 bg-black/20 p-5">
                 <div className="flex flex-wrap gap-2">
-                  <Button
-                    variant="secondary"
-                    leftIcon={<span className="text-base">🎥</span>}
-                    onClick={() => inputVideoRef.current?.click()}
-                  >
+                  <Button variant="secondary" leftIcon={<span className="text-base">🎥</span>} onClick={() => inputVideoRef.current?.click()}>
                     Выбрать файлы
                   </Button>
 
@@ -814,7 +826,10 @@ export default function UploadPage() {
             type="file"
             accept="image/*"
             multiple
-            onChange={(e) => addPending(Array.from(e.target.files ?? []), "photo")}
+            onChange={(e) => {
+              addPending(Array.from(e.target.files ?? []), "photo");
+              e.currentTarget.value = "";
+            }}
           />
 
           <input
@@ -823,7 +838,10 @@ export default function UploadPage() {
             type="file"
             accept="video/*"
             multiple
-            onChange={(e) => addPending(Array.from(e.target.files ?? []), "video")}
+            onChange={(e) => {
+              addPending(Array.from(e.target.files ?? []), "video");
+              e.currentTarget.value = "";
+            }}
           />
         </div>
 
@@ -833,75 +851,96 @@ export default function UploadPage() {
             <div>
               <div className="text-xl font-semibold">Статус проекта</div>
               <div className="mt-1 text-sm text-white/70">
-                Общая готовность: <span className="text-orange-200 tabular-nums">{overall}%</span>
+                <span className="text-white/85 font-semibold">
+                  Этап {CURRENT_STAGE}/{TOTAL_STAGES}
+                </span>{" "}
+                — {CURRENT_STAGE_TITLE} •{" "}
+                <span className="text-orange-200 tabular-nums">{stagePercent}%</span>
+              </div>
+              <div className="mt-1 text-xs text-white/55">
+                Дополнительно: техготовность по подсистемам ≈ <span className="text-white/75 tabular-nums">{subsystemsOverall}%</span>
               </div>
             </div>
 
             <div className="min-w-[240px] w-full sm:w-[360px]">
-              <ProgressBar value={clamp01(overall / 100) * 100} />
+              <ProgressBar value={clamp01(stagePercent / 100) * 100} />
+              <div className="mt-1 text-[11px] text-white/45">
+                прогресс текущего этапа (чеклист)
+              </div>
             </div>
           </div>
 
           <div className="mt-5 grid grid-cols-1 lg:grid-cols-2 gap-3">
-            {stages.map((s) => (
-              <div key={s.id} className="fx-glass rounded-2xl p-4">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="text-sm font-semibold text-white/85">{s.title}</div>
-                  <div className="text-xs text-white/60 tabular-nums">{s.percent}%</div>
-                </div>
+            <div className="fx-glass rounded-2xl p-4">
+              <div className="text-sm font-semibold text-white/85">Чеклист этапа {CURRENT_STAGE}/{TOTAL_STAGES}</div>
+              <ul className="mt-3 text-xs text-white/65 space-y-2">
+                {stage1Checklist.map((x, i) => (
+                  <li key={i} className="flex gap-2">
+                    <span className="shrink-0">{x.done ? "✅" : "⬜"}</span>
+                    <span>{x.text}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
 
-                <div className="mt-2">
-                  <ProgressBar value={clamp01(s.percent / 100) * 100} />
-                </div>
+            <div className="fx-glass rounded-2xl p-4">
+              <div className="text-sm font-semibold text-white/85">Changelog</div>
+              <ul className="mt-3 text-xs text-white/65 list-disc pl-5 space-y-1">
+                {changelog.map((x, i) => (
+                  <li key={i}>{x}</li>
+                ))}
+              </ul>
 
-                <ul className="mt-3 text-xs text-white/65 list-disc pl-5 space-y-1">
-                  {s.bullets.map((b, i) => (
-                    <li key={i}>{b}</li>
-                  ))}
-                </ul>
+              <div className="mt-4 text-xs text-white/55">
+                Следующий крупный шаг:{" "}
+                <span className="text-white/75">
+                  Этап 2/6 — Видео MVP: upload видео → extract frames → галерея кадров → render mp4 (H.264, без аудио)
+                </span>
               </div>
-            ))}
+            </div>
           </div>
 
-          <div className="mt-4 text-xs text-white/55">
-            Следующий крупный шаг:{" "}
-            <span className="text-white/75">
-              админка (отдельная страница): веса модели (mtime/sha/версия), health, train jobs, и переименование классов.
-            </span>
+          <div className="mt-5">
+            <div className="text-sm font-semibold text-white/80">Техпрогресс по подсистемам</div>
+            <div className="mt-3 grid grid-cols-1 lg:grid-cols-2 gap-3">
+              {subsystems.map((s) => (
+                <div key={s.id} className="fx-glass rounded-2xl p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="text-sm font-semibold text-white/85">{s.title}</div>
+                    <div className="text-xs text-white/60 tabular-nums">{s.percent}%</div>
+                  </div>
+
+                  <div className="mt-2">
+                    <ProgressBar value={clamp01(s.percent / 100) * 100} />
+                  </div>
+
+                  <ul className="mt-3 text-xs text-white/65 list-disc pl-5 space-y-1">
+                    {s.bullets.map((b, i) => (
+                      <li key={i}>{b}</li>
+                    ))}
+                  </ul>
+                </div>
+              ))}
+            </div>
           </div>
         </div>
-      </div>
 
-      {/* Upload modal */}
-      <Modal open={open} onClose={() => setOpen(false)} title="Загрузка фото" maxWidthClassName="max-w-[820px]">
-        <div className="relative">
-          <div className="flex items-start justify-between gap-4">
-            <div className="min-w-0">
-              <div className="text-lg font-semibold text-white/90">Отправляем файлы на сервер</div>
-              <div className="mt-1 text-sm text-white/65">Прогресс — UI-индикатор. После завершения фото появятся в галерее.</div>
-            </div>
-
-            <div className="shrink-0 text-right">
-              <div className="text-3xl font-semibold tabular-nums text-orange-200">{p}%</div>
-              <div className="text-[11px] text-white/45">progress</div>
-            </div>
-          </div>
-
-          <div className="mt-5 fx-glass rounded-2xl p-4">
+        {/* Upload modal */}
+        <Modal
+          open={open}
+          onClose={() => setOpen(false)}
+          title="Загрузка…"
+          closeOnBackdrop={false}
+          hideCloseButton
+          maxWidthClassName="max-w-[520px]"
+        >
+          <div className="space-y-3">
+            <div className="text-sm text-white/70">Загружаем файлы на сервер…</div>
             <ProgressBar value={p} />
-            <div className="mt-2 flex items-center justify-between text-xs text-white/55">
-              <span>Пожалуйста не закрывай вкладку во время загрузки</span>
-              <span className="tabular-nums">{p < 100 ? "в процессе…" : "готово"}</span>
-            </div>
+            <div className="text-[11px] text-white/45">Если загрузка прервалась — просто попробуй ещё раз.</div>
           </div>
-
-          <div className="mt-5 flex items-center justify-end gap-2">
-            <Button variant="secondary" onClick={() => setOpen(false)}>
-              Скрыть
-            </Button>
-          </div>
-        </div>
-      </Modal>
+        </Modal>
+      </div>
     </div>
   );
 }
