@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse, Response
-from typing import Any, Dict, List, Optional, Callable
+from typing import Any, Dict, List, Optional, Callable, Tuple
 from pathlib import Path
 import uuid
 import shutil
@@ -15,6 +15,8 @@ from urllib.parse import quote
 import json
 import hashlib
 import os
+
+from pydantic import BaseModel, Field
 
 from app.core.config import settings, ensure_dirs
 from app.services.storage import save_upload
@@ -39,24 +41,467 @@ from report_docx import build_defect_report_docx_bytes
 
 router = APIRouter(prefix="/api")
 
-# ---------------------------
-# Simple in-memory train jobs
-# ---------------------------
+# =========================================================
+# ✅ Train jobs on disk (instead of RAM) — survives restart
+# =========================================================
 
-_train_jobs: Dict[str, Dict[str, Any]] = {}
-_train_lock = threading.Lock()
+_SERVER_BOOT_ID = str(uuid.uuid4())
+_JOBS_DIR = settings.DATA_DIR / "_train_jobs"
+_JOBS_INDEX = _JOBS_DIR / "index.json"
+_JOBS_LOCK = threading.Lock()
+
+# Если лог не обновлялся > N секунд и job не done/error — считаем "lost"
+_JOB_STALE_SEC = int(getattr(settings, "TRAIN_JOB_STALE_SEC", 120) or 120)
+
+
+def _now_ns() -> int:
+    return time.time_ns()
+
+
+def _atomic_write_json(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _ensure_jobs_dir() -> None:
+    _JOBS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _job_path(job_id: str) -> Path:
+    return _JOBS_DIR / f"{job_id}.json"
+
+
+def _load_json(path: Path) -> Any:
+    try:
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _load_index() -> List[str]:
+    data = _load_json(_JOBS_INDEX)
+    if isinstance(data, list):
+        return [str(x) for x in data if str(x)]
+    return []
+
+
+def _save_index(ids: List[str]) -> None:
+    seen = set()
+    out: List[str] = []
+    for x in ids:
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    _atomic_write_json(_JOBS_INDEX, out)
+
+
+def _touch_index(job_id: str) -> None:
+    idx = _load_index()
+    _save_index([job_id] + idx)
+
+
+def _maybe_mark_lost(job: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Если сервис/воркер поменялся и лог давно не обновлялся — помечаем lost.
+    Это закрывает сценарий "рестарт -> job завис в running/queued навсегда".
+    """
+    try:
+        status = str(job.get("status") or "")
+        if status not in ("queued", "running"):
+            return job
+
+        boot_id = str(job.get("boot_id") or "")
+        if boot_id == _SERVER_BOOT_ID:
+            return job
+
+        log_path = Path(str(job.get("log_path") or ""))
+        if log_path.exists():
+            try:
+                age = time.time() - log_path.stat().st_mtime
+                if age <= float(_JOB_STALE_SEC):
+                    return job
+            except Exception:
+                pass
+
+        job["status"] = "lost"
+        job["message"] = (
+            "Сервис был перезапущен или статус читается из другого воркера. "
+            "Этот job больше не отслеживается в текущем процессе. "
+            "Проверь лог и запусти обучение заново при необходимости."
+        )
+        job["updated_at_ns"] = _now_ns()
+        _atomic_write_json(_job_path(str(job.get("job_id") or "")), job)
+        return job
+    except Exception:
+        return job
 
 
 def _set_job(job_id: str, patch: Dict[str, Any]) -> None:
-    with _train_lock:
-        cur = _train_jobs.get(job_id, {})
-        cur.update(patch)
-        _train_jobs[job_id] = cur
+    _ensure_jobs_dir()
+    with _JOBS_LOCK:
+        path = _job_path(job_id)
+        cur = _load_json(path)
+        if not isinstance(cur, dict):
+            cur = {}
+
+        if "job_id" not in cur:
+            cur["job_id"] = job_id
+        if "created_at_ns" not in cur:
+            cur["created_at_ns"] = _now_ns()
+
+        cur["boot_id"] = _SERVER_BOOT_ID
+        cur["worker_pid"] = os.getpid()
+
+        cur.update(patch or {})
+        cur["updated_at_ns"] = _now_ns()
+
+        _atomic_write_json(path, cur)
+        _touch_index(job_id)
 
 
 def _get_job(job_id: str) -> Dict[str, Any]:
-    with _train_lock:
-        return dict(_train_jobs.get(job_id, {}))
+    _ensure_jobs_dir()
+    with _JOBS_LOCK:
+        data = _load_json(_job_path(job_id))
+        if not isinstance(data, dict):
+            return {}
+    return _maybe_mark_lost(data)
+
+
+def _list_jobs(limit: int = 50) -> List[Dict[str, Any]]:
+    _ensure_jobs_dir()
+    limit = max(1, int(limit or 50))
+
+    idx = _load_index()
+    jobs: List[Dict[str, Any]] = []
+
+    if not idx:
+        try:
+            files = sorted(_JOBS_DIR.glob("train_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+            idx = [p.stem for p in files]
+        except Exception:
+            idx = []
+
+    for job_id in idx[:limit]:
+        j = _get_job(job_id)
+        if j:
+            jobs.append(j)
+
+    try:
+        jobs.sort(key=lambda x: int(x.get("updated_at_ns") or 0), reverse=True)
+    except Exception:
+        pass
+
+    return jobs
+
+
+# =========================================================
+# ✅ Accumulated dataset hygiene (C) — uses settings.ACCUM_DATASET_DIR
+# =========================================================
+
+def _resolve_accumulated_dir() -> Path:
+    """
+    ВАЖНО: накопительный датасет у вас строится в build_accumulated_dataset_for_session()
+    и живёт в settings.ACCUM_DATASET_DIR.
+    """
+    try:
+        p = getattr(settings, "ACCUM_DATASET_DIR", None)
+        if isinstance(p, Path):
+            return p
+        if isinstance(p, str) and p.strip():
+            return Path(p)
+    except Exception:
+        pass
+    # fallback на всякий случай
+    return settings.DATA_DIR / "_accumulated"
+
+
+def _resolve_accumulated_archive_dir(acc_dir: Path) -> Path:
+    # Архив рядом, чтобы не путаться в путях
+    try:
+        raw = getattr(settings, "ACCUMULATED_ARCHIVE_DIR", None)
+        if isinstance(raw, str) and raw.strip():
+            return Path(raw)
+        if isinstance(raw, Path):
+            return raw
+    except Exception:
+        pass
+    return acc_dir.parent / "_accumulated_archive"
+
+
+def _ensure_yolo_skeleton(root: Path) -> None:
+    (root / "images" / "train").mkdir(parents=True, exist_ok=True)
+    (root / "images" / "val").mkdir(parents=True, exist_ok=True)
+    (root / "labels" / "train").mkdir(parents=True, exist_ok=True)
+    (root / "labels" / "val").mkdir(parents=True, exist_ok=True)
+
+
+def _dir_size_bytes(p: Path) -> int:
+    total = 0
+    if not p.exists():
+        return 0
+    for f in p.rglob("*"):
+        if f.is_file():
+            try:
+                total += f.stat().st_size
+            except Exception:
+                pass
+    return total
+
+
+def _list_files(p: Path, exts: Tuple[str, ...]) -> List[Path]:
+    if not p.exists():
+        return []
+    out: List[Path] = []
+    for f in p.rglob("*"):
+        if f.is_file() and f.suffix.lower() in exts:
+            out.append(f)
+    return out
+
+
+def _mtime_ns(p: Path) -> int:
+    try:
+        return int(p.stat().st_mtime_ns)
+    except Exception:
+        return 0
+
+
+def _match_label_for_image(img: Path) -> Path:
+    parts = list(img.parts)
+    try:
+        idx = parts.index("images")
+        parts[idx] = "labels"
+        return Path(*parts).with_suffix(".txt")
+    except ValueError:
+        return img.with_suffix(".txt")
+
+
+def _load_manifest(dataset_dir: Path) -> Dict[str, Any]:
+    mp = dataset_dir / "manifest.json"
+    if not mp.exists():
+        return {}
+    try:
+        data = json.loads(mp.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_manifest(dataset_dir: Path, manifest: Dict[str, Any]) -> None:
+    mp = dataset_dir / "manifest.json"
+    try:
+        _atomic_write_json(mp, manifest if isinstance(manifest, dict) else {})
+    except Exception:
+        pass
+
+
+def _cleanup_manifest_missing_files(dataset_dir: Path, manifest: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(manifest, dict) or not manifest:
+        return manifest if isinstance(manifest, dict) else {}
+
+    cleaned: Dict[str, Any] = {}
+    removed = 0
+
+    for k, v in manifest.items():
+        if not isinstance(k, str) or not isinstance(v, dict):
+            removed += 1
+            continue
+
+        rel_img = str(v.get("image") or "")
+        rel_lbl = str(v.get("label") or "")
+
+        ok = True
+        if rel_img:
+            if not (dataset_dir / rel_img).exists():
+                ok = False
+        if rel_lbl:
+            if not (dataset_dir / rel_lbl).exists():
+                ok = False
+
+        if ok:
+            cleaned[k] = v
+        else:
+            removed += 1
+
+    # сохраняем только если реально что-то почистили
+    if removed > 0:
+        _save_manifest(dataset_dir, cleaned)
+
+    return cleaned
+
+
+def _accumulated_stats(acc_root: Path) -> Dict[str, Any]:
+    _ensure_yolo_skeleton(acc_root)
+
+    img_train = _list_files(acc_root / "images" / "train", (".jpg", ".jpeg", ".png", ".webp", ".bmp"))
+    img_val = _list_files(acc_root / "images" / "val", (".jpg", ".jpeg", ".png", ".webp", ".bmp"))
+    lab_train = _list_files(acc_root / "labels" / "train", (".txt",))
+    lab_val = _list_files(acc_root / "labels" / "val", (".txt",))
+
+    manifest = _load_manifest(acc_root)
+    manifest = _cleanup_manifest_missing_files(acc_root, manifest)
+
+    all_files = img_train + img_val + lab_train + lab_val
+    mt = [m for m in (_mtime_ns(x) for x in all_files) if m > 0]
+
+    return {
+        "accumulated_dir": str(acc_root),
+        "images": {"train": len(img_train), "val": len(img_val)},
+        "labels": {"train": len(lab_train), "val": len(lab_val)},
+        "manifest_items": len(manifest),
+        "bytes_total": _dir_size_bytes(acc_root),
+        "oldest_mtime_ns": min(mt) if mt else 0,
+        "newest_mtime_ns": max(mt) if mt else 0,
+    }
+
+
+def _accumulated_rotate(acc_root: Path, archive_root: Path, keep_archives: int = 5) -> Dict[str, Any]:
+    _ensure_yolo_skeleton(acc_root)
+    archive_root.mkdir(parents=True, exist_ok=True)
+
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    dst = archive_root / f"acc_{ts}"
+    if dst.exists():
+        dst = archive_root / f"acc_{ts}_{_now_ns()}"
+
+    shutil.move(str(acc_root), str(dst))
+
+    acc_root.mkdir(parents=True, exist_ok=True)
+    _ensure_yolo_skeleton(acc_root)
+
+    removed: List[str] = []
+    try:
+        archives = sorted(
+            [p for p in archive_root.iterdir() if p.is_dir() and p.name.startswith("acc_")],
+            key=lambda p: p.name,
+            reverse=True,
+        )
+        k = max(0, int(keep_archives or 0))
+        for p in archives[k:]:
+            try:
+                shutil.rmtree(p)
+                removed.append(p.name)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return {
+        "accumulated_dir": str(acc_root),
+        "archive_root": str(archive_root),
+        "archived_to": str(dst),
+        "removed_archives": removed,
+        "message": f"Ротация выполнена. Архив: {dst.name}.",
+    }
+
+
+def _accumulated_prune(
+    acc_root: Path,
+    keep_last_n: Optional[int] = None,
+    max_age_days: Optional[int] = None,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    _ensure_yolo_skeleton(acc_root)
+
+    imgs = _list_files(acc_root / "images", (".jpg", ".jpeg", ".png", ".webp", ".bmp"))
+    imgs_sorted = sorted(imgs, key=lambda p: _mtime_ns(p), reverse=True)
+
+    if keep_last_n is None and max_age_days is None:
+        return {
+            "accumulated_dir": str(acc_root),
+            "removed_images": 0,
+            "removed_labels": 0,
+            "removed_bytes": 0,
+            "kept_images": len(imgs_sorted),
+            "dry_run": bool(dry_run),
+            "message": "Ничего не сделано: не задан keep_last_n и max_age_days.",
+        }
+
+    keep: set[Path] = set()
+
+    if keep_last_n is not None:
+        n = max(0, int(keep_last_n))
+        keep.update(imgs_sorted[:n])
+
+    if max_age_days is not None:
+        days = max(0, int(max_age_days))
+        cutoff_ns = _now_ns() - int(days * 24 * 3600 * 1_000_000_000)
+        for p in imgs_sorted:
+            if _mtime_ns(p) >= cutoff_ns:
+                keep.add(p)
+
+    removed_images = 0
+    removed_labels = 0
+    removed_bytes = 0
+
+    for img in imgs_sorted:
+        if img in keep:
+            continue
+
+        lbl = _match_label_for_image(img)
+
+        try:
+            removed_bytes += img.stat().st_size
+        except Exception:
+            pass
+        if lbl.exists():
+            try:
+                removed_bytes += lbl.stat().st_size
+            except Exception:
+                pass
+
+        if not dry_run:
+            try:
+                img.unlink(missing_ok=True)
+                removed_images += 1
+            except Exception:
+                pass
+
+            if lbl.exists():
+                try:
+                    lbl.unlink(missing_ok=True)
+                    removed_labels += 1
+                except Exception:
+                    pass
+        else:
+            removed_images += 1
+            if lbl.exists():
+                removed_labels += 1
+
+    # ✅ подчистим manifest от битых ссылок
+    manifest_before = _load_manifest(acc_root)
+    if manifest_before:
+        if not dry_run:
+            _cleanup_manifest_missing_files(acc_root, manifest_before)
+        else:
+            # в dry-run не пишем на диск, только считаем
+            cleaned = _cleanup_manifest_missing_files(acc_root, dict(manifest_before))
+            _ = cleaned
+
+    return {
+        "accumulated_dir": str(acc_root),
+        "removed_images": removed_images,
+        "removed_labels": removed_labels,
+        "removed_bytes": removed_bytes,
+        "kept_images": len(keep),
+        "dry_run": bool(dry_run),
+        "message": "Ок. Очистка выполнена." if not dry_run else "Dry-run: посчитано, что было бы удалено.",
+    }
+
+
+class PruneReq(BaseModel):
+    keep_last_n: Optional[int] = Field(default=None, ge=0)
+    max_age_days: Optional[int] = Field(default=None, ge=0)
+    dry_run: bool = False
+
+
+class RotateReq(BaseModel):
+    keep_archives: int = Field(default=5, ge=0)
 
 
 # ---------------------------
@@ -476,7 +921,6 @@ def _invalidate_model_manager_cache_safe() -> None:
         if hasattr(mm, "invalidate") and callable(getattr(mm, "invalidate")):
             mm.invalidate()
             return
-        # fallback (на случай старого mm)
         for attr in ("_model", "_names", "_weights_key", "_use_seg"):
             if hasattr(mm, attr):
                 if attr == "_names":
@@ -545,20 +989,8 @@ def rename_class(session_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Некорректный payload")
 
-    frm = (
-        payload.get("from")
-        or payload.get("from_name")
-        or payload.get("old")
-        or payload.get("old_name")
-        or ""
-    )
-    to = (
-        payload.get("to")
-        or payload.get("to_name")
-        or payload.get("new")
-        or payload.get("new_name")
-        or ""
-    )
+    frm = payload.get("from") or payload.get("from_name") or payload.get("old") or payload.get("old_name") or ""
+    to = payload.get("to") or payload.get("to_name") or payload.get("new") or payload.get("new_name") or ""
 
     frm = str(frm or "").strip()
     to = str(to or "").strip()
@@ -580,6 +1012,53 @@ def health_ml(load: bool = False) -> Dict[str, Any]:
     ensure_dirs()
     mm = ModelManager.instance()
     return mm.describe(load=bool(load))
+
+
+# ==========================
+# ✅ Admin endpoints (C + D)
+# ==========================
+
+@router.get("/admin/accumulated/stats")
+def admin_accumulated_stats() -> Dict[str, Any]:
+    ensure_dirs()
+    acc = _resolve_accumulated_dir()
+    return _accumulated_stats(acc)
+
+
+@router.post("/admin/accumulated/prune")
+def admin_accumulated_prune(req: PruneReq) -> Dict[str, Any]:
+    ensure_dirs()
+    acc = _resolve_accumulated_dir()
+    return _accumulated_prune(
+        acc_root=acc,
+        keep_last_n=req.keep_last_n,
+        max_age_days=req.max_age_days,
+        dry_run=bool(req.dry_run),
+    )
+
+
+@router.post("/admin/accumulated/rotate")
+def admin_accumulated_rotate(req: RotateReq) -> Dict[str, Any]:
+    ensure_dirs()
+    acc = _resolve_accumulated_dir()
+    arch = _resolve_accumulated_archive_dir(acc)
+    return _accumulated_rotate(acc_root=acc, archive_root=arch, keep_archives=int(req.keep_archives))
+
+
+@router.get("/admin/train/jobs")
+def admin_train_jobs(limit: int = 50) -> Dict[str, Any]:
+    ensure_dirs()
+    items = _list_jobs(limit=limit)
+    return {"jobs_dir": str(_JOBS_DIR), "items": items}
+
+
+@router.get("/admin/train/jobs/{job_id}")
+def admin_train_job(job_id: str) -> Dict[str, Any]:
+    ensure_dirs()
+    j = _get_job(job_id)
+    if not j:
+        raise HTTPException(status_code=404, detail="Job не найден")
+    return {"jobs_dir": str(_JOBS_DIR), "item": j}
 
 
 @router.post("/sessions")
@@ -798,7 +1277,7 @@ def download_report_docx(session_id: str):
 @router.post("/sessions/{session_id}/train")
 def train(session_id: str, quality: bool = False) -> Dict[str, Any]:
     """
-    quality=false: накопительный датасет по одной сессии
+    quality=false: накопительный датасет по одной сессии (ACCUM_DATASET_DIR)
     quality=true: global yolo_det по всем sessions
     """
     ensure_dirs()
@@ -999,7 +1478,6 @@ def train(session_id: str, quality: bool = False) -> Dict[str, Any]:
                     return
 
             # 2) resolve model + device
-            # ✅ Пишем туда же, откуда читает infer (INFER_MODEL_PATH если задан, иначе data/models/model.pt)
             target_model = settings.resolve_infer_model()
             target_model.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1089,10 +1567,8 @@ def train(session_id: str, quality: bool = False) -> Dict[str, Any]:
             chosen: Optional[Path] = best_pt if best_pt.exists() else (last_pt if last_pt.exists() else None)
 
             if chosen:
-                # ✅ копируем веса в target_model (тот же файл, который читает infer)
                 shutil.copy2(chosen, target_model)
 
-                # ✅ гарантируем обновление mtime у target_model (жёсткий триггер reload по weights_key)
                 try:
                     os.utime(str(target_model), None)
                 except Exception:
