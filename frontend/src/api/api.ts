@@ -1,4 +1,4 @@
-// src/api/api.ts
+// frontend/src/api/api.ts
 import type { PhotoItem, OperatorDecision, BBox } from "../types";
 import type { DefectClass } from "../constants/defects";
 import { DEFECT_CLASSES } from "../constants/defects";
@@ -64,9 +64,11 @@ export type UploadPhotosResultItem = { id: string; filename: string; url: string
 // ---- Train API ----
 export type TrainStartResult = { job_id: string; status: string; message: string };
 
+// status делаем максимально “гибким”: бэк может добавить новые состояния.
+// нормализацию делаем на уровне store/UI.
 export type TrainStatusResult = {
   job_id: string;
-  status: "queued" | "running" | "done" | "error";
+  status: string;
   message: string;
   model_path?: string | null;
   dataset_dir?: string | null;
@@ -79,6 +81,10 @@ export type TrainStatusResult = {
   model_sha256_before?: string | null;
   model_sha256_after?: string | null;
   model_version_path?: string | null;
+
+  // optional flags for stability
+  lost?: boolean;
+  error_code?: string;
 };
 
 // ---- Infer API ----
@@ -155,12 +161,38 @@ function joinUrl(pathOrUrl: string) {
   return `${RAW_BASE}${p}`;
 }
 
+function extractMessageFromJson(j: any): string | null {
+  if (!j || typeof j !== "object") return null;
+
+  if (typeof j.detail === "string") return j.detail;
+  if (typeof j.message === "string") return j.message;
+
+  // FastAPI often: { detail: { message: "...", ... } }
+  if (j.detail && typeof j.detail === "object") {
+    if (typeof j.detail.message === "string") return j.detail.message;
+    if (typeof j.detail.error === "string") return j.detail.error;
+    if (j.detail.error && typeof j.detail.error === "object" && typeof j.detail.error.message === "string") return j.detail.error.message;
+  }
+
+  if (j.error && typeof j.error === "object") {
+    if (typeof j.error.message === "string") return j.error.message;
+  }
+
+  return null;
+}
+
 async function parseErrorMessage(res: Response, fallbackStatus: number) {
   let msg = `Ошибка запроса: ${fallbackStatus}`;
   try {
-    const j = await res.json();
-    if (typeof (j as any)?.detail === "string") msg = (j as any).detail;
-    else if (typeof (j as any)?.message === "string") msg = (j as any).message;
+    const ct = (res.headers.get("content-type") || "").toLowerCase();
+    if (ct.includes("application/json")) {
+      const j = await res.json();
+      const m = extractMessageFromJson(j);
+      if (m) return m;
+    } else {
+      const txt = await res.text().catch(() => "");
+      if (txt && txt.trim()) return txt.slice(0, 800);
+    }
   } catch {
     // ignore
   }
@@ -303,16 +335,11 @@ export const api = {
 
   /**
    * ✅ Rename класса (переименование).
-   * ВАЖНО: эндпоинт на бэке нужно будет добавить.
-   * Предлагаемый контракт:
+   * Контракт:
    * POST /sessions/{sid}/classes/rename { from: string, to: string }
    * -> { ok: true, classes: string[] }
    */
-  async renameSessionClass(
-    sessionId: string,
-    from: string,
-    to: string
-  ): Promise<{ ok: true; classes: string[] }> {
+  async renameSessionClass(sessionId: string, from: string, to: string): Promise<{ ok: true; classes: string[] }> {
     return await httpJson<{ ok: true; classes: string[] }>(`/sessions/${encodeURIComponent(sessionId)}/classes/rename`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
