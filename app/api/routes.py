@@ -36,22 +36,11 @@ from app.services.dataset_builder import (
 )
 from app.ml.infer import run_yolo_infer
 from app.services.model_manager import ModelManager
+from app.services import train_job_store
 from report_docx import build_defect_report_docx_bytes
 
 
 router = APIRouter(prefix="/api")
-
-# =========================================================
-# ✅ Train jobs on disk (instead of RAM) — survives restart
-# =========================================================
-
-_SERVER_BOOT_ID = str(uuid.uuid4())
-_JOBS_DIR = settings.DATA_DIR / "_train_jobs"
-_JOBS_INDEX = _JOBS_DIR / "index.json"
-_JOBS_LOCK = threading.Lock()
-
-# Если лог не обновлялся > N секунд и job не done/error — считаем "lost"
-_JOB_STALE_SEC = int(getattr(settings, "TRAIN_JOB_STALE_SEC", 120) or 120)
 
 
 def _now_ns() -> int:
@@ -65,149 +54,14 @@ def _atomic_write_json(path: Path, data: Any) -> None:
     os.replace(tmp, path)
 
 
-def _ensure_jobs_dir() -> None:
-    _JOBS_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def _job_path(job_id: str) -> Path:
-    return _JOBS_DIR / f"{job_id}.json"
-
-
-def _load_json(path: Path) -> Any:
-    try:
-        if not path.exists():
-            return None
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-
-
-def _load_index() -> List[str]:
-    data = _load_json(_JOBS_INDEX)
-    if isinstance(data, list):
-        return [str(x) for x in data if str(x)]
-    return []
-
-
-def _save_index(ids: List[str]) -> None:
-    seen = set()
-    out: List[str] = []
-    for x in ids:
-        if x in seen:
-            continue
-        seen.add(x)
-        out.append(x)
-    _atomic_write_json(_JOBS_INDEX, out)
-
-
-def _touch_index(job_id: str) -> None:
-    idx = _load_index()
-    _save_index([job_id] + idx)
-
-
-def _maybe_mark_lost(job: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Если сервис/воркер поменялся и лог давно не обновлялся — помечаем lost.
-    Это закрывает сценарий "рестарт -> job завис в running/queued навсегда".
-    """
-    try:
-        status = str(job.get("status") or "")
-        if status not in ("queued", "running"):
-            return job
-
-        boot_id = str(job.get("boot_id") or "")
-        if boot_id == _SERVER_BOOT_ID:
-            return job
-
-        log_path = Path(str(job.get("log_path") or ""))
-        if log_path.exists():
-            try:
-                age = time.time() - log_path.stat().st_mtime
-                if age <= float(_JOB_STALE_SEC):
-                    return job
-            except Exception:
-                pass
-
-        job["status"] = "lost"
-        job["message"] = (
-            "Сервис был перезапущен или статус читается из другого воркера. "
-            "Этот job больше не отслеживается в текущем процессе. "
-            "Проверь лог и запусти обучение заново при необходимости."
-        )
-        job["updated_at_ns"] = _now_ns()
-        _atomic_write_json(_job_path(str(job.get("job_id") or "")), job)
-        return job
-    except Exception:
-        return job
-
-
-def _set_job(job_id: str, patch: Dict[str, Any]) -> None:
-    _ensure_jobs_dir()
-    with _JOBS_LOCK:
-        path = _job_path(job_id)
-        cur = _load_json(path)
-        if not isinstance(cur, dict):
-            cur = {}
-
-        if "job_id" not in cur:
-            cur["job_id"] = job_id
-        if "created_at_ns" not in cur:
-            cur["created_at_ns"] = _now_ns()
-
-        cur["boot_id"] = _SERVER_BOOT_ID
-        cur["worker_pid"] = os.getpid()
-
-        cur.update(patch or {})
-        cur["updated_at_ns"] = _now_ns()
-
-        _atomic_write_json(path, cur)
-        _touch_index(job_id)
-
-
-def _get_job(job_id: str) -> Dict[str, Any]:
-    _ensure_jobs_dir()
-    with _JOBS_LOCK:
-        data = _load_json(_job_path(job_id))
-        if not isinstance(data, dict):
-            return {}
-    return _maybe_mark_lost(data)
-
-
-def _list_jobs(limit: int = 50) -> List[Dict[str, Any]]:
-    _ensure_jobs_dir()
-    limit = max(1, int(limit or 50))
-
-    idx = _load_index()
-    jobs: List[Dict[str, Any]] = []
-
-    if not idx:
-        try:
-            files = sorted(_JOBS_DIR.glob("train_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-            idx = [p.stem for p in files]
-        except Exception:
-            idx = []
-
-    for job_id in idx[:limit]:
-        j = _get_job(job_id)
-        if j:
-            jobs.append(j)
-
-    try:
-        jobs.sort(key=lambda x: int(x.get("updated_at_ns") or 0), reverse=True)
-    except Exception:
-        pass
-
-    return jobs
-
-
 # =========================================================
 # ✅ Accumulated dataset hygiene (C) — uses settings.ACCUM_DATASET_DIR
 # =========================================================
 
 def _resolve_accumulated_dir() -> Path:
     """
-    ВАЖНО: накопительный датасет у вас строится в build_accumulated_dataset_for_session()
-    и живёт в settings.ACCUM_DATASET_DIR.
+    Накопительный датасет строится в build_accumulated_dataset_for_session()
+    и живёт в settings.ACCUM_DATASET_DIR (если нет — fallback).
     """
     try:
         p = getattr(settings, "ACCUM_DATASET_DIR", None)
@@ -217,12 +71,10 @@ def _resolve_accumulated_dir() -> Path:
             return Path(p)
     except Exception:
         pass
-    # fallback на всякий случай
     return settings.DATA_DIR / "_accumulated"
 
 
 def _resolve_accumulated_archive_dir(acc_dir: Path) -> Path:
-    # Архив рядом, чтобы не путаться в путях
     try:
         raw = getattr(settings, "ACCUMULATED_ARCHIVE_DIR", None)
         if isinstance(raw, str) and raw.strip():
@@ -328,7 +180,6 @@ def _cleanup_manifest_missing_files(dataset_dir: Path, manifest: Dict[str, Any])
         else:
             removed += 1
 
-    # сохраняем только если реально что-то почистили
     if removed > 0:
         _save_manifest(dataset_dir, cleaned)
 
@@ -473,15 +324,13 @@ def _accumulated_prune(
             if lbl.exists():
                 removed_labels += 1
 
-    # ✅ подчистим manifest от битых ссылок
+    # cleanup manifest (remove broken refs)
     manifest_before = _load_manifest(acc_root)
     if manifest_before:
         if not dry_run:
             _cleanup_manifest_missing_files(acc_root, manifest_before)
         else:
-            # в dry-run не пишем на диск, только считаем
-            cleaned = _cleanup_manifest_missing_files(acc_root, dict(manifest_before))
-            _ = cleaned
+            _cleanup_manifest_missing_files(acc_root, dict(manifest_before))
 
     return {
         "accumulated_dir": str(acc_root),
@@ -546,7 +395,7 @@ def _resolve_photo_file_path(session_id: str, photo_id: str) -> Optional[Path]:
         try:
             rel_clean = rel.replace("\\", "/").lstrip("/")
             if rel_clean.lower().startswith("uploads/"):
-                rel_clean = rel_clean[len("uploads/") :]
+                rel_clean = rel_clean[len("uploads/"):]
             _add(settings.UPLOADS_DIR / Path(rel_clean))
         except Exception:
             pass
@@ -913,8 +762,7 @@ def _norm_xywh_bbox(bbox: Any) -> List[float]:
 
 def _invalidate_model_manager_cache_safe() -> None:
     """
-    ✅ После train надо гарантированно сбросить кэш модели,
-    чтобы следующий infer пересоздал YOLO по новому weights_key.
+    После train сбрасываем кэш модели, чтобы следующий infer пересоздал YOLO по новому weights_key.
     """
     try:
         mm = ModelManager.instance()
@@ -1048,17 +896,17 @@ def admin_accumulated_rotate(req: RotateReq) -> Dict[str, Any]:
 @router.get("/admin/train/jobs")
 def admin_train_jobs(limit: int = 50) -> Dict[str, Any]:
     ensure_dirs()
-    items = _list_jobs(limit=limit)
-    return {"jobs_dir": str(_JOBS_DIR), "items": items}
+    items = train_job_store.list_jobs(limit=limit)
+    return {"jobs_dir": str(train_job_store.JOBS_DIR), "items": items}
 
 
 @router.get("/admin/train/jobs/{job_id}")
 def admin_train_job(job_id: str) -> Dict[str, Any]:
     ensure_dirs()
-    j = _get_job(job_id)
+    j = train_job_store.get_job(job_id)
     if not j:
         raise HTTPException(status_code=404, detail="Job не найден")
-    return {"jobs_dir": str(_JOBS_DIR), "item": j}
+    return {"jobs_dir": str(train_job_store.JOBS_DIR), "item": j}
 
 
 @router.post("/sessions")
@@ -1152,7 +1000,7 @@ def infer_photo(session_id: str, photo_id: str) -> Dict[str, Any]:
             continue
 
         cls_name = str(item.get("class") or "unknown")
-        conf = float(item.get("confidence") or 0.0)
+        conf = float(item.get("confidence") if item.get("confidence") is not None else 0.0)
         conf = _clamp01(conf)
 
         bbox_raw = item.get("bbox") if isinstance(item.get("bbox"), list) and len(item["bbox"]) == 4 else [0, 0, 0, 0]
@@ -1293,7 +1141,7 @@ def train(session_id: str, quality: bool = False) -> Dict[str, Any]:
 
     cuda_snap = _torch_cuda_snapshot()
 
-    _set_job(
+    train_job_store.set_job(
         job_id,
         {
             "job_id": job_id,
@@ -1338,7 +1186,7 @@ def train(session_id: str, quality: bool = False) -> Dict[str, Any]:
                     prog = 0.0
                     if epochs_total > 0:
                         prog = min(0.99, max(0.0, float(ep_done) / float(epochs_total)))
-                    _set_job(
+                    train_job_store.set_job(
                         job_id,
                         {
                             "status": "running",
@@ -1377,7 +1225,7 @@ def train(session_id: str, quality: bool = False) -> Dict[str, Any]:
                         msg_bits.append(f"батч {batch_i+1}/{nb}")
                     message = " • ".join(msg_bits)
 
-                    _set_job(
+                    train_job_store.set_job(
                         job_id,
                         {
                             "status": "running",
@@ -1410,13 +1258,13 @@ def train(session_id: str, quality: bool = False) -> Dict[str, Any]:
         try:
             # 1) build dataset
             if quality:
-                _set_job(job_id, {"status": "running", "message": "Подготовка датасета (global yolo_det)...", "progress": 0.05})
+                train_job_store.set_job(job_id, {"status": "running", "message": "Подготовка датасета (global yolo_det)...", "progress": 0.05})
                 try:
                     build_g = build_yolo_det_dataset_from_all_sessions(incremental=True)
                 except ValueError as e:
                     msg = str(e)
                     _write_log("[ERROR] " + msg.replace("\n", " "))
-                    _set_job(job_id, {"status": "error", "message": msg, "progress": 0.0})
+                    train_job_store.set_job(job_id, {"status": "error", "message": msg, "progress": 0.0})
                     return
 
                 _write_log(f"[DATASET] mode=global dir={build_g.dataset_dir}")
@@ -1432,7 +1280,7 @@ def train(session_id: str, quality: bool = False) -> Dict[str, Any]:
 
                 dataset_total = int(build_g.photos_included)
                 dataset_boxes = int(build_g.total_boxes_kept)
-                _set_job(job_id, {"dataset_total": dataset_total, "dataset_boxes": dataset_boxes})
+                train_job_store.set_job(job_id, {"dataset_total": dataset_total, "dataset_boxes": dataset_boxes})
 
                 data_yaml = build_g.data_yaml
                 if not data_yaml.exists():
@@ -1444,11 +1292,11 @@ def train(session_id: str, quality: bool = False) -> Dict[str, Any]:
                         "Нужно больше разметки (decision='defect' + bbox)."
                     )
                     _write_log("[ERROR] " + msg.replace("\n", " "))
-                    _set_job(job_id, {"status": "error", "message": msg, "progress": 0.0})
+                    train_job_store.set_job(job_id, {"status": "error", "message": msg, "progress": 0.0})
                     return
 
             else:
-                _set_job(job_id, {"status": "running", "message": "Подготовка датасета (накопление)...", "progress": 0.05})
+                train_job_store.set_job(job_id, {"status": "running", "message": "Подготовка датасета (накопление)...", "progress": 0.05})
 
                 build = build_accumulated_dataset_for_session(session_id, incremental=True)
                 _write_log(f"[DATASET] mode=session dir={build.dataset_dir}")
@@ -1461,7 +1309,7 @@ def train(session_id: str, quality: bool = False) -> Dict[str, Any]:
 
                 dataset_total = _read_accumulated_total(build.dataset_dir)
                 _write_log(f"[DATASET] accumulated_total={dataset_total}")
-                _set_job(job_id, {"dataset_total": int(dataset_total)})
+                train_job_store.set_job(job_id, {"dataset_total": int(dataset_total)})
 
                 data_yaml = build.data_yaml
                 if not data_yaml.exists():
@@ -1474,7 +1322,7 @@ def train(session_id: str, quality: bool = False) -> Dict[str, Any]:
                         f"Dataset: {build.dataset_dir}"
                     )
                     _write_log("[ERROR] " + msg.replace("\n", " "))
-                    _set_job(job_id, {"status": "error", "message": msg, "progress": 0.0})
+                    train_job_store.set_job(job_id, {"status": "error", "message": msg, "progress": 0.0})
                     return
 
             # 2) resolve model + device
@@ -1491,7 +1339,7 @@ def train(session_id: str, quality: bool = False) -> Dict[str, Any]:
 
             sha_before = _sha256_file(base_model)
             _write_log(f"[MODEL] sha256_before={sha_before}")
-            _set_job(job_id, {"model_sha256_before": sha_before})
+            train_job_store.set_job(job_id, {"model_sha256_before": sha_before})
 
             cuda_snap2 = _torch_cuda_snapshot()
             _write_log(
@@ -1499,7 +1347,7 @@ def train(session_id: str, quality: bool = False) -> Dict[str, Any]:
                 f"count={cuda_snap2.get('cuda_device_count')} name={cuda_snap2.get('gpu_name')} "
                 f"torch_cuda={cuda_snap2.get('torch_cuda_version')}"
             )
-            _set_job(
+            train_job_store.set_job(
                 job_id,
                 {
                     "gpu_available": bool(cuda_snap2.get("gpu_available")),
@@ -1510,7 +1358,7 @@ def train(session_id: str, quality: bool = False) -> Dict[str, Any]:
             )
 
             resolved_device = _resolve_train_device()
-            _set_job(job_id, {"resolved_device": str(resolved_device)})
+            train_job_store.set_job(job_id, {"resolved_device": str(resolved_device)})
 
             patience = _get_train_patience()
             seed = _get_train_seed()
@@ -1526,7 +1374,7 @@ def train(session_id: str, quality: bool = False) -> Dict[str, Any]:
                 f"project={settings.BASE_DIR / 'runs' / 'detect'} name={job_id}"
             )
 
-            _set_job(job_id, {"message": f"Запуск обучения YOLO (device={resolved_device})...", "progress": 0.10})
+            train_job_store.set_job(job_id, {"message": f"Запуск обучения YOLO (device={resolved_device})...", "progress": 0.10})
 
             from ultralytics import YOLO
 
@@ -1578,7 +1426,7 @@ def train(session_id: str, quality: bool = False) -> Dict[str, Any]:
                         pass
 
                 _write_log(f"[TRAIN] Copied {chosen} -> {target_model}")
-                _set_job(job_id, {"model_path": str(target_model)})
+                train_job_store.set_job(job_id, {"model_path": str(target_model)})
 
                 try:
                     _invalidate_model_manager_cache_safe()
@@ -1591,14 +1439,14 @@ def train(session_id: str, quality: bool = False) -> Dict[str, Any]:
                 version_path = hist_dir / f"model_{job_id}.pt"
                 shutil.copy2(chosen, version_path)
                 _write_log(f"[MODEL] Version saved -> {version_path}")
-                _set_job(job_id, {"model_version_path": str(version_path)})
+                train_job_store.set_job(job_id, {"model_version_path": str(version_path)})
 
             sha_after = _sha256_file(target_model)
             _write_log(f"[MODEL] sha256_after={sha_after}")
-            _set_job(job_id, {"model_sha256_after": sha_after})
+            train_job_store.set_job(job_id, {"model_sha256_after": sha_after})
 
             done_evt.set()
-            _set_job(
+            train_job_store.set_job(
                 job_id,
                 {
                     "status": "done",
@@ -1613,7 +1461,7 @@ def train(session_id: str, quality: bool = False) -> Dict[str, Any]:
             done_evt.set()
             _write_log("[ERROR] Training failed:")
             _write_log(traceback.format_exc())
-            _set_job(job_id, {"status": "error", "message": f"Ошибка обучения: {e}"})
+            train_job_store.set_job(job_id, {"status": "error", "message": f"Ошибка обучения: {e}"})
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
@@ -1623,7 +1471,7 @@ def train(session_id: str, quality: bool = False) -> Dict[str, Any]:
 
 @router.get("/train/{job_id}/status")
 def train_status(job_id: str) -> Dict[str, Any]:
-    j = _get_job(job_id)
+    j = train_job_store.get_job(job_id)
     if not j:
         raise HTTPException(status_code=404, detail="Job не найден")
     return j
@@ -1631,7 +1479,7 @@ def train_status(job_id: str) -> Dict[str, Any]:
 
 @router.get("/train/{job_id}/log")
 def train_log(job_id: str):
-    j = _get_job(job_id)
+    j = train_job_store.get_job(job_id)
     if not j:
         raise HTTPException(status_code=404, detail="Job не найден")
     p = Path(j.get("log_path") or "")
