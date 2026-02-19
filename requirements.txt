@@ -3,8 +3,7 @@ uvicorn[standard]==0.34.0
 python-multipart==0.0.9
 pydantic==2.10.6
 python-docx==1.1.2
-
-# Stage 3: YOLOv8 inference
+pydantic-settings==2.5.2
 ultralytics==8.3.0
 numpy==1.26.4
 pillow>=10.0.0
