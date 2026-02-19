@@ -1,4 +1,4 @@
-// src/store/useTrainStore.ts
+// frontend/src/store/useTrainStore.ts
 import { create } from "zustand";
 import { persist, createJSONStorage } from "zustand/middleware";
 import { api } from "../api/api";
@@ -24,6 +24,33 @@ type TrainStoreState = {
 
 function clamp(v: number, a: number, b: number) {
   return Math.max(a, Math.min(b, v));
+}
+
+function normalizeTrainStatus(raw: any): { status: TrainStatus; raw: string } {
+  const s = String(raw ?? "").trim().toLowerCase();
+
+  if (s === "queued") return { status: "queued", raw: s };
+  if (s === "running") return { status: "running", raw: s };
+  if (s === "done") return { status: "done", raw: s };
+  if (s === "error") return { status: "error", raw: s };
+
+  // backwards/edge statuses from backend
+  if (
+    s === "lost" ||
+    s === "stale" ||
+    s === "failed" ||
+    s === "aborted" ||
+    s === "canceled" ||
+    s === "cancelled"
+  ) {
+    return { status: "error", raw: s };
+  }
+
+  // empty / missing -> treat as running (keep old behavior)
+  if (!s) return { status: "running", raw: s };
+
+  // unknown non-empty -> error (fail-safe)
+  return { status: "error", raw: s };
 }
 
 /**
@@ -160,7 +187,7 @@ function stopTimers() {
 
 export const useTrainStore = create<TrainStoreState>()(
   persist(
-    (set, get) => ({
+    (set) => ({
       jobId: null,
       status: "idle",
       message: "",
@@ -228,10 +255,16 @@ function ensureMonitorRunning() {
       try {
         const prevStatus = cur.status;
         const jobId = cur.jobId;
-        const r = await api.trainStatus(jobId);
 
-        const nextStatus = (r?.status as TrainStatus) || "running";
-        const msg = String(r?.message ?? "").trim();
+        const r: any = await api.trainStatus(jobId);
+
+        const norm = normalizeTrainStatus(r?.status);
+        const nextStatus = norm.status;
+
+        let msg = String(r?.message ?? "").trim();
+        if (!msg && nextStatus === "error" && norm.raw && !["queued", "running", "done", "error"].includes(norm.raw)) {
+          msg = `Неизвестный статус обучения: "${norm.raw}"`;
+        }
 
         const { epoch, total } = parseEpochInfo(r);
         const { batch, total: bt } = parseBatchInfo(r);
